@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tek17-rag"
+version = "0.1.0"
+description = "TEK17 extraction and RAG research pipeline"
+readme = "README.md"
+requires-python = ">=3.10"
+
+authors = [
+  { name = "Kristina Kufaas" },
+  { name = "Oskar Fritzner" },
+  { name = "Mats Aakvik Johansen" }
+]
+
+dependencies = [
+  "requests>=2.32,<3",
+  "beautifulsoup4>=4.12,<5",
+  "lxml>=5,<7",
+  "typer>=0.9,<1"
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.scripts]
+tek17 = "tek17.cli:app"
