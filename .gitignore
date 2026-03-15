@@ -3,7 +3,7 @@
 venv/
 
 # Data (raw + processed)
-data/
+/Data
 
 # Environment variables
 .env

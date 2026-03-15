@@ -1,6 +1,8 @@
 import typer
 from pathlib import Path
 
+from tek17.rag.config import EMBED_MODEL as _CONFIG_EMBED_MODEL
+
 # ---------------------------------------------------------------------------
 # Lazy-import constants for CLI defaults.
 # Heavy dependencies (chromadb, etc.) are imported inside commands to keep
@@ -13,7 +15,7 @@ _DEFAULT_ROOT_PRINT_URL = (
 _DEFAULT_JSONL_PATH = Path("data/processed/tek17_dibk.jsonl")
 _DEFAULT_CHROMA_DIR = Path("data/vectorstore/chroma")
 _COLLECTION_NAME = "tek17"
-_EMBED_MODEL = "nomic-embed-text"
+_EMBED_MODEL = _CONFIG_EMBED_MODEL
 _OLLAMA_BASE_URL = "http://localhost:11434"
 _CHUNK_SIZE = 800
 _CHUNK_OVERLAP = 200

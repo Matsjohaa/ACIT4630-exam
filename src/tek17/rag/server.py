@@ -11,27 +11,31 @@ Or via the CLI:
 """
 from __future__ import annotations
 
+import json
 import textwrap
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-import chromadb
-import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-DEFAULT_CHROMA_DIR = Path("data/vectorstore/chroma")
-COLLECTION_NAME = "tek17"
-
-OLLAMA_BASE_URL = "http://localhost:11434"
-EMBED_MODEL = "nomic-embed-text"
-LLM_MODEL = "llama3.2"
-
-TOP_K = 6
+from tek17.rag.embedding.client import embed_query
+from tek17.rag.llm.client import chat
+from tek17.rag.retrieval.client import get_collection, query_collection
+from tek17.rag.config import (
+    CHROMA_DIR,
+    CHROMA_COLLECTION,
+    LOG_DIR,
+    QUERY_LOG_PATH,
+    OLLAMA_BASE_URL,
+    EMBED_MODEL,
+    EMBED_PROVIDER,
+    LLM_MODEL,
+    LLM_PROVIDER,
+    TOP_K,
+)
 
 SYSTEM_PROMPT = textwrap.dedent("""\
     Du er en ekspert på norske byggeforskrifter, spesielt TEK17 \
@@ -52,63 +56,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-# ---------------------------------------------------------------------------
-# Startup: load ChromaDB collection
-# ---------------------------------------------------------------------------
-_collection: Optional[chromadb.Collection] = None
-
-
-def _get_collection() -> chromadb.Collection:
-    global _collection
-    if _collection is None:
-        chroma_dir = DEFAULT_CHROMA_DIR.resolve()
-        if not chroma_dir.exists():
-            raise RuntimeError(
-                f"ChromaDB vector store not found at {chroma_dir}. "
-                "Run `python -m tek17 ingest` first."
-            )
-        client = chromadb.PersistentClient(path=str(chroma_dir))
-        _collection = client.get_collection(COLLECTION_NAME)
-    return _collection
-
-
-# ---------------------------------------------------------------------------
-# Embedding helper
-# ---------------------------------------------------------------------------
-
-def _embed_query(text: str) -> list[float]:
-    resp = requests.post(
-        f"{OLLAMA_BASE_URL}/api/embed",
-        json={"model": EMBED_MODEL, "input": [text]},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    return resp.json()["embeddings"][0]
-
-
-# ---------------------------------------------------------------------------
-# Ollama chat helper
-# ---------------------------------------------------------------------------
-
-def _ollama_chat(
-    messages: list[dict],
-    model: str = LLM_MODEL,
-    temperature: float = 0.3,
-) -> str:
-    resp = requests.post(
-        f"{OLLAMA_BASE_URL}/api/chat",
-        json={
-            "model": model,
-            "messages": messages,
-            "stream": False,
-            "options": {"temperature": temperature},
-        },
-        timeout=120,
-    )
-    resp.raise_for_status()
-    return resp.json()["message"]["content"]
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +86,25 @@ class QueryResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Logging helpers
+# ---------------------------------------------------------------------------
+
+def _log_query_event(event: dict) -> None:
+    """Append a single query event as JSONL for offline analysis.
+
+    Logging failures should never break the API, so errors are swallowed.
+    """
+
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with QUERY_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+    except Exception:
+        # Best-effort logging only
+        return
+
+
+# ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
@@ -150,23 +116,24 @@ def health():
 @app.post("/query", response_model=QueryResponse)
 def query(req: QueryRequest):
     try:
-        collection = _get_collection()
+        collection = get_collection(CHROMA_DIR, CHROMA_COLLECTION)
     except Exception as e:
         raise HTTPException(status_code=503, detail=str(e))
 
     # Embed the query
-    q_embedding = _embed_query(req.question)
-
-    # Retrieve top-k chunks
-    results = collection.query(
-        query_embeddings=[q_embedding],
-        n_results=req.top_k,
-        include=["documents", "metadatas", "distances"],
+    q_embedding = embed_query(
+        req.question,
+        provider=EMBED_PROVIDER,
+        model=EMBED_MODEL,
+        base_url=OLLAMA_BASE_URL,
     )
 
-    documents = results["documents"][0] if results["documents"] else []
-    metadatas = results["metadatas"][0] if results["metadatas"] else []
-    distances = results["distances"][0] if results["distances"] else []
+    # Retrieve top-k chunks
+    documents, metadatas, distances = query_collection(
+        collection=collection,
+        query_embedding=q_embedding,
+        top_k=req.top_k,
+    )
 
     # Build context
     context_parts: list[str] = []
@@ -196,7 +163,38 @@ def query(req: QueryRequest):
         {"role": "user", "content": user_msg},
     ]
 
-    answer = _ollama_chat(messages, model=req.model, temperature=req.temperature)
+    try:
+        answer = chat(
+            messages,
+            provider=LLM_PROVIDER,
+            model=req.model,
+            base_url=OLLAMA_BASE_URL,
+            temperature=req.temperature,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"LLM provider error: {e}")
+
+    # Best-effort structured logging for refusal / retrieval analysis
+    event = {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "question": req.question,
+        "top_k": req.top_k,
+        "model": req.model,
+        "temperature": req.temperature,
+        "retrieved": [
+            {
+                "section_id": s.section_id,
+                "title": s.title,
+                "chapter": s.chapter,
+                "text_type": s.text_type,
+                "distance": s.distance,
+            }
+            for s in sources
+        ],
+        "context": context_block,
+        "answer": answer,
+    }
+    _log_query_event(event)
 
     return QueryResponse(
         answer=answer,
@@ -210,6 +208,8 @@ def query(req: QueryRequest):
 def list_models():
     """Proxy to Ollama's model list so the Streamlit client can show available models."""
     try:
+        import requests
+
         resp = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=10)
         resp.raise_for_status()
         models = resp.json().get("models", [])
@@ -222,7 +222,7 @@ def list_models():
 def collection_stats():
     """Return basic stats about the vector store collection."""
     try:
-        col = _get_collection()
-        return {"collection": COLLECTION_NAME, "count": col.count()}
+        col = get_collection(CHROMA_DIR, CHROMA_COLLECTION)
+        return {"collection": CHROMA_COLLECTION, "count": col.count()}
     except Exception as e:
         raise HTTPException(status_code=503, detail=str(e))
