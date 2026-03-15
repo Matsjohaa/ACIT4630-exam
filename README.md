@@ -136,3 +136,18 @@ python -m tek17 download-dibk --force
 python -m tek17 parse-dibk
 python -m tek17 ingest
 ```
+
+### Canonical TEK17 snapshot for this project
+
+For all experiments, analyses and evaluation in this repo we use a **fixed TEK17 snapshot** to ensure everyone (group + examiner) works on the exact same document version.
+
+- **Root-print URL:** https://www.dibk.no/regelverk/byggteknisk-forskrift-tek17?subtype=root&print=true
+- **Canonical URL:** https://www.dibk.no/regelverk/byggteknisk-forskrift-tek17
+- **Downloaded at:** `2026-03-13T11:56:22`
+- **Raw HTML file:** `data/raw/dibk_root_print/2026-03-13/tek17_full_root_print.html`
+- **Processed corpus file:** `data/processed/tek17_dibk.jsonl`
+- **SHA256 (raw HTML):** `56e9dd740ea27b3b699c45285f2c4a21fcab455a85e4d00f69379ad44eb618f5`
+
+All RAG indexing, retrieval and refusal analysis in this project is expected to be based on this snapshot. If you re-download TEK17 at a later date, treat it as a **new version** and do not overwrite this canonical snapshot.
+
+````
