@@ -40,9 +40,11 @@ from tek17.rag.config import (
 SYSTEM_PROMPT = textwrap.dedent("""\
     Du er en ekspert på norske byggeforskrifter, spesielt TEK17 \
     (Byggteknisk forskrift). Svar alltid på norsk med mindre brukeren \
-    skriver på engelsk. Baser svaret ditt på konteksten som er gitt. \
-    Hvis konteksten ikke inneholder nok informasjon til å svare, si fra \
-    om det. Referer til relevante paragrafer (§) når du svarer.\
+    skriver på engelsk. Baser svaret ditt utelukkende på konteksten som er gitt \
+    (RAG/vektordatabasen). Du har ikke lov til å bruke egen kunnskap eller antakelser. \
+    Hvis konteksten ikke inneholder grunnlag for et konkret svar, start svaret med: \
+    "KAN_IKKE_SVARE:" og si at du ikke har nok informasjon i databasen/konteksten. \
+    Referer til relevante paragrafer (§) kun når de faktisk finnes i konteksten.\
 """)
 
 # ---------------------------------------------------------------------------
@@ -152,6 +154,18 @@ def query(req: QueryRequest):
         )
 
     context_block = "\n\n---\n\n".join(context_parts)
+
+    if not context_block.strip():
+        answer = (
+            'KAN_IKKE_SVARE: Jeg har ikke nok informasjon i RAG-databasen/konteksten '
+            'til å gi et konkret svar på dette spørsmålet.'
+        )
+        return QueryResponse(
+            answer=answer,
+            sources=sources,
+            model=req.model,
+            question=req.question,
+        )
 
     user_msg = (
         f"Kontekst fra TEK17:\n\n{context_block}\n\n"

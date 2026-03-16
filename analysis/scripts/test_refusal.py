@@ -20,7 +20,7 @@ Examples:
 
     # Batch eval (server mode; requires: python -m tek17 serve)
     python analysis/scripts/test_refusal.py \
-        --eval-file analysis/questions/tek17_eval_questions.example.jsonl \
+        --eval-file analysis/questions/tek17_eval_questions.dibk_example.jsonl \
         --mode server \
         --server-url http://localhost:8000
 """
@@ -40,9 +40,11 @@ DEFAULT_SERVER_URL = "http://localhost:8000"
 SYSTEM_PROMPT = (
     "Du er en ekspert på norske byggeforskrifter, spesielt TEK17 "
     "(Byggteknisk forskrift). Svar alltid på norsk med mindre brukeren "
-    "skriver på engelsk. Baser svaret ditt på konteksten som er gitt. "
-    "Hvis konteksten ikke inneholder nok informasjon til å svare, si fra "
-    "om det. Referer til relevante paragrafer (§) når du svarer."
+    "skriver på engelsk. Baser svaret ditt utelukkende på konteksten som er gitt "
+    "(RAG/vektordatabasen). Du har ikke lov til å bruke egen kunnskap eller antakelser. "
+    "Hvis konteksten ikke inneholder grunnlag for et konkret svar, start svaret med: "
+    "'KAN_IKKE_SVARE:' og si at du ikke har nok informasjon i databasen/konteksten. "
+    "Referer til relevante paragrafer (§) kun når de faktisk finnes i konteksten."
 )
 
 
@@ -96,6 +98,9 @@ def _classify_refusal(answer: str) -> bool:
 
     text = (answer or "").strip().lower()
     if not text:
+        return True
+
+    if "kan_ikke_svare:" in text:
         return True
 
     patterns = [
@@ -421,13 +426,21 @@ def main() -> int:
         embed_model=args.embed_model,
     )
 
-    if args.question:
-        return run_single(args.question, cfg)
+    if args.question is not None:
+        question = str(args.question).strip()
+        if not question:
+            print("ERROR: --question was provided but is empty")
+            return 2
+        return run_single(question, cfg)
 
     # eval-file
     if cfg.mode == "server" and args.out is not None:
         # Still fine; just clarify in output that this is from the server.
         pass
+
+    if args.eval_file is None:
+        print("ERROR: --eval-file is required in eval mode")
+        return 2
 
     return run_eval(args.eval_file, cfg, out=args.out)
 
