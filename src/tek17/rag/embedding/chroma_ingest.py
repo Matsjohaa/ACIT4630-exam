@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import logging
 import json
 import hashlib
 from pathlib import Path
 
 import chromadb
+from chromadb.config import Settings
+
+
+logging.getLogger("chromadb.telemetry.product.posthog").disabled = True
 
 from .client import embed_texts
 from tek17.rag.config import (
@@ -19,8 +24,16 @@ from tek17.rag.config import (
 
 def _stable_id(text: str, meta: dict) -> str:
     """Deterministic ID so re-ingestion is idempotent."""
-    key = f"{meta.get('section_id', '')}::{text[:200]}"
-    return hashlib.sha256(key.encode()).hexdigest()[:24]
+    section_id = meta.get("section_id", "")
+    text_type = meta.get("text_type", "")
+    para_start = meta.get("para_start", "")
+    para_end = meta.get("para_end", "")
+
+    # Include a hash of the full text to avoid collisions when multiple chunks
+    # share the same prefix (common with overlapping chunk windows).
+    text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    key = f"{section_id}::{text_type}::{para_start}-{para_end}::{text_hash}"
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:24]
 
 
 def _load_chunks(path: Path) -> list[dict]:
@@ -67,7 +80,10 @@ def ingest_chunks_to_chroma(
     )
 
     chroma_dir.mkdir(parents=True, exist_ok=True)
-    client = chromadb.PersistentClient(path=str(chroma_dir))
+    client = chromadb.PersistentClient(
+        path=str(chroma_dir),
+        settings=Settings(anonymized_telemetry=False),
+    )
 
     try:
         client.delete_collection(collection_name)

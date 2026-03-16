@@ -106,7 +106,7 @@ src/tek17/
 ├── app/
 │   ├── __init__.py
 │   └── ui.py             # Streamlit chat frontend
-├── corpus/               # TEK17 corpus pipeline (no ML)
+├── corpus/               # TEK17 corpus pipeline
 │   ├── __init__.py
 │   ├── download.py       # Download TEK17 root-print from DiBK
 │   ├── parse.py          # Parse HTML into per-§ JSONL records

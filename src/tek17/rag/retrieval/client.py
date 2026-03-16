@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
 import chromadb
+from chromadb.config import Settings
+
+
+# Chroma's Posthog telemetry integration can be noisy if the installed
+# `posthog` package has an incompatible API. Telemetry is non-essential
+# for this project, so we silence the telemetry logger.
+logging.getLogger("chromadb.telemetry.product.posthog").disabled = True
 
 
 _collection_cache: dict[tuple[Path, str], chromadb.Collection] = {}
@@ -26,7 +34,10 @@ def get_collection(chroma_dir: Path, collection_name: str) -> chromadb.Collectio
             "Run `python -m tek17 ingest` first."
         )
 
-    client = chromadb.PersistentClient(path=str(chroma_dir))
+    client = chromadb.PersistentClient(
+        path=str(chroma_dir),
+        settings=Settings(anonymized_telemetry=False),
+    )
     collection = client.get_collection(collection_name)
     _collection_cache[key] = collection
     return collection
