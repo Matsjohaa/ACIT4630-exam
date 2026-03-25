@@ -29,23 +29,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Literal
 
+from tek17.rag.prompts import SYSTEM_PROMPT
+
 
 DEFAULT_SERVER_URL = "http://localhost:8000"
-
-
-SYSTEM_PROMPT = (
-    "Du er en ekspert på norske byggeforskrifter, spesielt TEK17 "
-    "(Byggteknisk forskrift). Svar alltid på norsk med mindre brukeren "
-    "skriver på engelsk. Baser svaret ditt utelukkende på konteksten som er gitt "
-    "(RAG/vektordatabasen). Du har ikke lov til å bruke egen kunnskap eller antakelser. "
-    "Hvis konteksten ikke inneholder grunnlag for et konkret svar, start svaret med: "
-    "'KAN_IKKE_SVARE:' og si at du ikke har nok informasjon i databasen/konteksten. "
-    "Referer til relevante paragrafer (§) kun når de faktisk finnes i konteksten."
-)
 
 
 Mode = Literal["local", "server"]
@@ -91,6 +83,14 @@ def _write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def _has_refusal_tag(answer: str) -> bool:
+    text = (answer or "").strip().lower()
+    if not text:
+        return False
+    # Allow the model to wrap it in quotes.
+    return "kan_ikke_svare:" in text
+
+
 def _classify_refusal(answer: str) -> bool:
     """Simple heuristic refusal detector.
 
@@ -100,22 +100,22 @@ def _classify_refusal(answer: str) -> bool:
     if not text:
         return True
 
-    if "kan_ikke_svare:" in text:
+    if _has_refusal_tag(text):
         return True
 
     patterns = [
         # Norwegian-ish
         "kan ikke svare",
         "kan ikke gi et sikkert svar",
+        "kan ikke gi et konkret svar",
         "har ikke nok informasjon",
         "finner ikke nok informasjon",
         "ikke nok informasjon",
+        "mangler informasjon",
+        "har ikke grunnlag",
+        "finner ikke grunnlag",
         "utenfor det som dekkes av tek17",
         "utenfor tek17",
-        "jeg kan ikke",
-        "jeg har ikke",
-        "jeg finner ikke",
-        "jeg har ikke tilgang",
         # English-ish
         "i can't answer",
         "i cannot answer",
@@ -124,6 +124,57 @@ def _classify_refusal(answer: str) -> bool:
         "outside the scope",
     ]
     return any(p in text for p in patterns)
+
+
+def _safe_div(num: float, den: float) -> float:
+    return num / den if den else 0.0
+
+
+def _wilson_ci(successes: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """Wilson score interval for a binomial proportion.
+
+    Returns (low, high). If n==0 returns (0, 0).
+    """
+    if n <= 0:
+        return 0.0, 0.0
+    phat = successes / n
+    denom = 1.0 + (z * z) / n
+    center = (phat + (z * z) / (2.0 * n)) / denom
+    half = (z / denom) * math.sqrt((phat * (1.0 - phat) / n) + (z * z) / (4.0 * n * n))
+    lo = max(0.0, center - half)
+    hi = min(1.0, center + half)
+    return lo, hi
+
+
+def _compute_refusal_metrics(tp: int, fp: int, tn: int, fn: int) -> dict[str, float]:
+    """Compute standard metrics treating 'refuse' as the positive class."""
+    total = tp + fp + tn + fn
+    accuracy = _safe_div(tp + tn, total)
+
+    precision = _safe_div(tp, tp + fp)
+    recall = _safe_div(tp, tp + fn)  # TPR / sensitivity
+    specificity = _safe_div(tn, tn + fp)  # TNR
+    f1 = _safe_div(2.0 * precision * recall, precision + recall)
+    balanced_accuracy = 0.5 * (recall + specificity)
+
+    # Matthews correlation coefficient
+    denom = math.sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
+    mcc = ((tp * tn) - (fp * fn)) / denom if denom else 0.0
+
+    refusal_rate_pred = _safe_div(tp + fp, total)
+    refusal_rate_true = _safe_div(tp + fn, total)
+
+    return {
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "specificity": specificity,
+        "f1": f1,
+        "balanced_accuracy": balanced_accuracy,
+        "mcc": mcc,
+        "refusal_rate_pred": refusal_rate_pred,
+        "refusal_rate_true": refusal_rate_true,
+    }
 
 
 def _retrieval_hit(sources: list[dict[str, Any]], target_sections: list[str]) -> bool:
@@ -277,6 +328,9 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
     correct = 0
 
     tp_refuse = fp_refuse = tn_refuse = fn_refuse = 0
+    # Stratified by retrieval hit
+    tp_hit = fp_hit = tn_hit = fn_hit = 0
+    tp_miss = fp_miss = tn_miss = fn_miss = 0
 
     rows_out: list[dict[str, Any]] = []
 
@@ -309,7 +363,9 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
         sources = data.get("sources", []) or []
 
         retrieval_hit = _retrieval_hit(sources, list(target_sections) if isinstance(target_sections, list) else [])
-        model_refused = _classify_refusal(answer)
+        refused_tagged = _has_refusal_tag(answer)
+        refused_heuristic = _classify_refusal(answer)
+        model_refused = refused_tagged or refused_heuristic
 
         if should_refuse and model_refused:
             tp_refuse += 1
@@ -324,6 +380,25 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
             fn_refuse += 1
             status = "under_refusal"
 
+        if retrieval_hit:
+            if should_refuse and model_refused:
+                tp_hit += 1
+            elif (not should_refuse) and (not model_refused):
+                tn_hit += 1
+            elif (not should_refuse) and model_refused:
+                fp_hit += 1
+            else:
+                fn_hit += 1
+        else:
+            if should_refuse and model_refused:
+                tp_miss += 1
+            elif (not should_refuse) and (not model_refused):
+                tn_miss += 1
+            elif (not should_refuse) and model_refused:
+                fp_miss += 1
+            else:
+                fn_miss += 1
+
         if (should_refuse and model_refused) or ((not should_refuse) and (not model_refused)):
             correct += 1
 
@@ -336,6 +411,8 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
                     "question": question,
                     "should_refuse": should_refuse,
                     "model_refused": model_refused,
+                    "refused_tagged": refused_tagged,
+                    "refused_heuristic": refused_heuristic,
                     "status": status,
                     "retrieval_hit": retrieval_hit,
                     "target_sections": target_sections,
@@ -350,14 +427,37 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
 
     if total:
         accuracy = correct / total
+        acc_lo, acc_hi = _wilson_ci(correct, total)
+        metrics = _compute_refusal_metrics(tp_refuse, fp_refuse, tn_refuse, fn_refuse)
         print()
         print(f"Total eval items: {total}")
-        print(f"Refusal behaviour accuracy: {accuracy:.3f}")
+        print(f"Refusal behaviour accuracy: {accuracy:.3f} (95% CI {acc_lo:.3f}–{acc_hi:.3f})")
         print("Confusion matrix (refusal vs. label):")
         print(f"  TP (correct refusals)      : {tp_refuse}")
         print(f"  FP (over-refusals)         : {fp_refuse}")
         print(f"  TN (correct answers)       : {tn_refuse}")
         print(f"  FN (under-refusals)        : {fn_refuse}")
+
+        print()
+        print("Metrics (refusal = positive class):")
+        print(f"  Precision (PPV)            : {metrics['precision']:.3f}")
+        print(f"  Recall (TPR/sensitivity)   : {metrics['recall']:.3f}")
+        print(f"  Specificity (TNR)          : {metrics['specificity']:.3f}")
+        print(f"  F1                         : {metrics['f1']:.3f}")
+        print(f"  Balanced accuracy          : {metrics['balanced_accuracy']:.3f}")
+        print(f"  MCC                        : {metrics['mcc']:.3f}")
+        print(f"  Refusal rate (pred / true) : {metrics['refusal_rate_pred']:.3f} / {metrics['refusal_rate_true']:.3f}")
+
+        # Stratified metrics can help distinguish retrieval issues from refusal logic.
+        n_hit = tp_hit + fp_hit + tn_hit + fn_hit
+        n_miss = tp_miss + fp_miss + tn_miss + fn_miss
+        if n_hit and n_miss:
+            m_hit = _compute_refusal_metrics(tp_hit, fp_hit, tn_hit, fn_hit)
+            m_miss = _compute_refusal_metrics(tp_miss, fp_miss, tn_miss, fn_miss)
+            print()
+            print("Breakdown by retrieval_hit:")
+            print(f"  retrieval_hit=1 (n={n_hit}) acc={m_hit['accuracy']:.3f} f1={m_hit['f1']:.3f} mcc={m_hit['mcc']:.3f}")
+            print(f"  retrieval_hit=0 (n={n_miss}) acc={m_miss['accuracy']:.3f} f1={m_miss['f1']:.3f} mcc={m_miss['mcc']:.3f}")
 
     if out is not None:
         _write_jsonl(out, rows_out)

@@ -2,7 +2,7 @@
 FastAPI RAG server for TEK17.
 
 Retrieves relevant provision chunks from ChromaDB and generates answers
-using an Ollama LLM.
+using a configurable LLM provider (Ollama by default, OpenAI optional).
 
 Run with:
     uvicorn tek17.rag.server:app --reload --port 8000
@@ -12,7 +12,6 @@ Or via the CLI:
 from __future__ import annotations
 
 import json
-import textwrap
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -23,6 +22,7 @@ from pydantic import BaseModel, Field
 
 from tek17.rag.embedding.client import embed_query
 from tek17.rag.llm.client import chat
+from tek17.rag.prompts import SYSTEM_PROMPT
 from tek17.rag.retrieval.client import get_collection, query_collection
 from tek17.rag.config import (
     CHROMA_DIR,
@@ -34,18 +34,9 @@ from tek17.rag.config import (
     EMBED_PROVIDER,
     LLM_MODEL,
     LLM_PROVIDER,
+    LLM_MAX_TOKENS,
     TOP_K,
 )
-
-SYSTEM_PROMPT = textwrap.dedent("""\
-    Du er en ekspert på norske byggeforskrifter, spesielt TEK17 \
-    (Byggteknisk forskrift). Svar alltid på norsk med mindre brukeren \
-    skriver på engelsk. Baser svaret ditt utelukkende på konteksten som er gitt \
-    (RAG/vektordatabasen). Du har ikke lov til å bruke egen kunnskap eller antakelser. \
-    Hvis konteksten ikke inneholder grunnlag for et konkret svar, start svaret med: \
-    "KAN_IKKE_SVARE:" og si at du ikke har nok informasjon i databasen/konteksten. \
-    Referer til relevante paragrafer (§) kun når de faktisk finnes i konteksten.\
-""")
 
 # ---------------------------------------------------------------------------
 # FastAPI app
@@ -67,8 +58,18 @@ app.add_middleware(
 class QueryRequest(BaseModel):
     question: str = Field(..., min_length=1, description="User question about TEK17")
     top_k: int = Field(default=TOP_K, ge=1, le=20)
-    model: str = Field(default=LLM_MODEL, description="Ollama model to use")
+    provider: Optional[str] = Field(
+        default=None,
+        description="LLM provider override: 'ollama' or 'openai' (defaults to TEK17_LLM_PROVIDER)",
+    )
+    model: str = Field(default=LLM_MODEL, description="LLM model name (Ollama or OpenAI)")
     temperature: float = Field(default=0.3, ge=0.0, le=2.0)
+    max_tokens: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=4096,
+        description="Optional output token cap (defaults to TEK17_LLM_MAX_TOKENS if set)",
+    )
 
 
 class SourceChunk(BaseModel):
@@ -178,12 +179,21 @@ def query(req: QueryRequest):
     ]
 
     try:
+        provider = (req.provider or LLM_PROVIDER).strip().lower()
+        if provider not in {"ollama", "openai"}:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid provider. Must be 'ollama' or 'openai'.",
+            )
+
+        max_tokens = req.max_tokens if req.max_tokens is not None else LLM_MAX_TOKENS
         answer = chat(
             messages,
-            provider=LLM_PROVIDER,
+            provider=provider,  # type: ignore[arg-type]
             model=req.model,
             base_url=OLLAMA_BASE_URL,
             temperature=req.temperature,
+            max_tokens=max_tokens,
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"LLM provider error: {e}")
@@ -221,6 +231,11 @@ def query(req: QueryRequest):
 @app.get("/models")
 def list_models():
     """Proxy to Ollama's model list so the Streamlit client can show available models."""
+    if (LLM_PROVIDER or "").strip().lower() != "ollama":
+        return {
+            "models": [],
+            "note": "Model listing is only available for the Ollama provider.",
+        }
     try:
         import requests
 

@@ -35,6 +35,30 @@ ollama pull nomic-embed-text   # embedding model
 ollama pull llama3.2           # LLM
 ```
 
+Optional: use OpenAI instead of Ollama
+
+This project can use either Ollama (local) or OpenAI (hosted) for:
+- Embeddings (`TEK17_EMBED_PROVIDER`)
+- The LLM (`TEK17_LLM_PROVIDER`)
+
+Set `OPENAI_API_KEY` (or `OPEN_AI_API_KEY`) and choose providers/models:
+
+```bash
+# Use OpenAI for the LLM
+export TEK17_LLM_PROVIDER="openai"
+export TEK17_LLM_MODEL="gpt-4.1-mini"   # or gpt-4.1
+
+# Keep costs down (recommended)
+export TEK17_LLM_TEMPERATURE="0"
+export TEK17_LLM_MAX_TOKENS="350"
+
+# (Optional) Use OpenAI for embeddings too
+# export TEK17_EMBED_PROVIDER="openai"
+# export TEK17_EMBED_MODEL="text-embedding-3-small"
+```
+
+If you use Azure OpenAI or another compatible endpoint, also set `OPENAI_BASE_URL`.
+
 ---
 
 ## 2. End-to-end quick start
@@ -91,6 +115,10 @@ When a user asks a question (via UI or API):
 6. **Logging** – each `/query` call is written to `analysis/logging/rag_queries.jsonl` for later analysis.
 
 This makes it possible to inspect exactly what the model saw when it answered or refused.
+
+Note: the FastAPI `/query` endpoint supports optional per-request overrides:
+- `provider`: `'ollama'` or `'openai'` (otherwise uses `TEK17_LLM_PROVIDER`)
+- `max_tokens`: output cap for that request (otherwise uses `TEK17_LLM_MAX_TOKENS`)
 
 ---
 

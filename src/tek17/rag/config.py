@@ -89,6 +89,14 @@ OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")  # for Azure / custom endpoints
 LLM_PROVIDER = os.getenv("TEK17_LLM_PROVIDER", "ollama")
 LLM_MODEL = os.getenv("TEK17_LLM_MODEL", "llama3.2")
 
+# Optional output cap for hosted LLMs (e.g., OpenAI) to control cost.
+# If unset/invalid, no explicit cap is sent to the provider.
+try:
+    _LLM_MAX_TOKENS_RAW = os.getenv("TEK17_LLM_MAX_TOKENS", "").strip()
+    LLM_MAX_TOKENS = int(_LLM_MAX_TOKENS_RAW) if _LLM_MAX_TOKENS_RAW else None
+except ValueError:
+    LLM_MAX_TOKENS = None
+
 try:
     LLM_TEMPERATURE = float(os.getenv("TEK17_LLM_TEMPERATURE", "0.3"))
 except ValueError:
