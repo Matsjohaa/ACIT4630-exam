@@ -23,12 +23,13 @@ from pydantic import BaseModel, Field
 from tek17.rag.embedding.client import embed_query
 from tek17.rag.llm.client import chat
 from tek17.rag.prompts import SYSTEM_PROMPT
-from tek17.rag.retrieval.client import get_collection, query_collection
+from tek17.rag.retrieval.client import get_collection, retrieve
 from tek17.rag.config import (
     CHROMA_DIR,
     CHROMA_COLLECTION,
     LOG_DIR,
     QUERY_LOG_PATH,
+    CHUNKS_PATH,
     OLLAMA_BASE_URL,
     EMBED_MODEL,
     EMBED_PROVIDER,
@@ -36,6 +37,8 @@ from tek17.rag.config import (
     LLM_PROVIDER,
     LLM_MAX_TOKENS,
     TOP_K,
+    RETRIEVAL_METHOD,
+    HYBRID_ALPHA,
 )
 
 # ---------------------------------------------------------------------------
@@ -58,6 +61,17 @@ app.add_middleware(
 class QueryRequest(BaseModel):
     question: str = Field(..., min_length=1, description="User question about TEK17")
     top_k: int = Field(default=TOP_K, ge=1, le=20)
+
+    retrieval_method: str = Field(
+        default=RETRIEVAL_METHOD,
+        description="Retrieval method: 'dense', 'sparse' (or legacy 'sparce'), or 'hybrid'",
+    )
+    hybrid_alpha: float = Field(
+        default=HYBRID_ALPHA,
+        ge=0.0,
+        le=1.0,
+        description="Hybrid weighting: alpha*dense + (1-alpha)*sparse",
+    )
     provider: Optional[str] = Field(
         default=None,
         description="LLM provider override: 'ollama' or 'openai' (defaults to TEK17_LLM_PROVIDER)",
@@ -123,19 +137,27 @@ def query(req: QueryRequest):
     except Exception as e:
         raise HTTPException(status_code=503, detail=str(e))
 
-    # Embed the query
-    q_embedding = embed_query(
-        req.question,
-        provider=EMBED_PROVIDER,
-        model=EMBED_MODEL,
-        base_url=OLLAMA_BASE_URL,
-    )
+    retrieval_method = (req.retrieval_method or RETRIEVAL_METHOD).strip().lower()
+    if retrieval_method == "sparce":
+        retrieval_method = "sparse"
 
-    # Retrieve top-k chunks
-    documents, metadatas, distances = query_collection(
+    q_embedding: list[float] | None = None
+    if retrieval_method in {"dense", "hybrid"}:
+        q_embedding = embed_query(
+            req.question,
+            provider=EMBED_PROVIDER,
+            model=EMBED_MODEL,
+            base_url=OLLAMA_BASE_URL,
+        )
+
+    documents, metadatas, distances = retrieve(
         collection=collection,
+        query_text=req.question,
         query_embedding=q_embedding,
         top_k=req.top_k,
+        method=retrieval_method,
+        chunks_path=CHUNKS_PATH,
+        hybrid_alpha=req.hybrid_alpha,
     )
 
     # Build context
@@ -203,6 +225,8 @@ def query(req: QueryRequest):
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "question": req.question,
         "top_k": req.top_k,
+        "retrieval_method": retrieval_method,
+        "hybrid_alpha": req.hybrid_alpha,
         "model": req.model,
         "temperature": req.temperature,
         "retrieved": [

@@ -52,6 +52,9 @@ class RunConfig:
     model: str | None
     temperature: float | None
 
+    retrieval_method: str
+    hybrid_alpha: float
+
     # Server mode
     server_url: str
 
@@ -193,7 +196,12 @@ def _retrieval_hit(sources: list[dict[str, Any]], target_sections: list[str]) ->
 def _query_server(question: str, cfg: RunConfig) -> dict[str, Any]:
     import requests
 
-    payload: dict[str, Any] = {"question": question, "top_k": cfg.top_k}
+    payload: dict[str, Any] = {
+        "question": question,
+        "top_k": cfg.top_k,
+        "retrieval_method": cfg.retrieval_method,
+        "hybrid_alpha": cfg.hybrid_alpha,
+    }
     if cfg.model is not None:
         payload["model"] = cfg.model
     if cfg.temperature is not None:
@@ -207,21 +215,29 @@ def _query_server(question: str, cfg: RunConfig) -> dict[str, Any]:
 def _query_local(question: str, cfg: RunConfig) -> dict[str, Any]:
     from tek17.rag.embedding.client import embed_query
     from tek17.rag.llm.client import chat
-    from tek17.rag.retrieval.client import get_collection, query_collection
+    from tek17.rag.retrieval.client import get_collection, retrieve
 
     collection = get_collection(cfg.chroma_dir, cfg.collection)
 
-    q_embedding = embed_query(
-        question,
-        provider=cfg.embed_provider,
-        model=cfg.embed_model,
-        base_url=cfg.ollama_url,
-    )
+    q_embedding: list[float] | None = None
+    if cfg.retrieval_method in {"dense", "hybrid"}:
+        q_embedding = embed_query(
+            question,
+            provider=cfg.embed_provider,
+            model=cfg.embed_model,
+            base_url=cfg.ollama_url,
+        )
 
-    documents, metadatas, distances = query_collection(
+    from tek17.rag.config import CHUNKS_PATH
+
+    documents, metadatas, distances = retrieve(
         collection=collection,
+        query_text=question,
         query_embedding=q_embedding,
         top_k=cfg.top_k,
+        method=cfg.retrieval_method,
+        chunks_path=CHUNKS_PATH,
+        hybrid_alpha=cfg.hybrid_alpha,
     )
 
     sources: list[dict[str, Any]] = []
@@ -264,6 +280,7 @@ def _query_local(question: str, cfg: RunConfig) -> dict[str, Any]:
         "sources": sources,
         "model": cfg.llm_model,
         "question": question,
+        "retrieval_method": cfg.retrieval_method,
     }
 
 
@@ -420,6 +437,8 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
                     "sources": sources,
                     "mode": cfg.mode,
                     "top_k": cfg.top_k,
+                    "retrieval_method": cfg.retrieval_method,
+                    "hybrid_alpha": cfg.hybrid_alpha,
                     "model": data.get("model", cfg.model or cfg.llm_model),
                     "temperature": cfg.temperature,
                 }
@@ -480,6 +499,19 @@ def _build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--top-k", type=int, default=6)
 
+    parser.add_argument(
+        "--retrieval-method",
+        choices=["dense", "sparse", "sparce", "hybrid"],
+        default="dense",
+        help="Retrieval method for local mode.",
+    )
+    parser.add_argument(
+        "--hybrid-alpha",
+        type=float,
+        default=0.5,
+        help="Hybrid weighting: alpha*dense + (1-alpha)*sparse.",
+    )
+
     # Common overrides
     parser.add_argument("--model", type=str, default=None, help="Override model (server mode only)")
     parser.add_argument("--temperature", type=float, default=None)
@@ -511,11 +543,17 @@ def _build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = _build_parser().parse_args()
 
+    retrieval_method = str(args.retrieval_method).strip().lower()
+    if retrieval_method == "sparce":
+        retrieval_method = "sparse"
+
     cfg = RunConfig(
         mode=args.mode,
         top_k=args.top_k,
         model=args.model,
         temperature=args.temperature,
+        retrieval_method=retrieval_method,
+        hybrid_alpha=float(args.hybrid_alpha),
         server_url=args.server_url,
         chroma_dir=args.chroma_dir,
         collection=args.collection,

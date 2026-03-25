@@ -35,11 +35,14 @@ def openai_chat(
 	base_url = OPENAI_BASE_URL or os.getenv("OPENAI_BASE_URL")
 	client = OpenAI(api_key=api_key, base_url=base_url) if base_url else OpenAI(api_key=api_key)
 
-	resp = client.chat.completions.create(
-		model=model,
-		messages=messages,
-		temperature=temperature,
-		max_tokens=max_tokens,
-	)
+	kwargs: dict[str, object] = {
+		"model": model,
+		"messages": messages,
+		"temperature": temperature,
+	}
+	if max_tokens is not None:
+		kwargs["max_tokens"] = max_tokens
+
+	resp = client.chat.completions.create(**kwargs)
 	return resp.choices[0].message.content or ""
 

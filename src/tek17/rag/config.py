@@ -107,6 +107,14 @@ except ValueError:
 # RAG behaviour
 # ---------------------------------------------------------------------------
 
+# Retrieval method selection
+RETRIEVAL_METHOD = os.getenv("TEK17_RETRIEVAL_METHOD", "dense").strip().lower()
+
+try:
+    HYBRID_ALPHA = float(os.getenv("TEK17_HYBRID_ALPHA", "0.5"))
+except ValueError:
+    HYBRID_ALPHA = 0.5
+
 try:
     TOP_K = int(os.getenv("TEK17_TOP_K", "6"))
 except ValueError:

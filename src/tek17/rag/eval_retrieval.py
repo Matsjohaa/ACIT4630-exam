@@ -17,7 +17,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from tek17.rag.embedding.client import embed_query
-from tek17.rag.retrieval.client import get_collection, query_collection
+from tek17.rag.retrieval.client import get_collection, retrieve
+from tek17.rag.config import CHUNKS_PATH
 
 
 # Keep these consistent with the main server configuration
@@ -52,6 +53,8 @@ def evaluate_retrieval(
     chroma_dir: Path = DEFAULT_CHROMA_DIR,
     collection_name: str = COLLECTION_NAME,
     top_k: int = DEFAULT_TOP_K,
+    retrieval_method: str = "dense",
+    hybrid_alpha: float = 0.5,
 ) -> None:
     if not eval_file.exists():
         raise SystemExit(f"Eval file not found: {eval_file}")
@@ -81,17 +84,23 @@ def evaluate_retrieval(
         if has_targets:
             total_with_targets += 1
 
-        q_embedding = embed_query(
-            question,
-            provider="ollama",
-            model=EMBED_MODEL,
-            base_url=OLLAMA_BASE_URL,
-        )
+        q_embedding: list[float] | None = None
+        if retrieval_method in {"dense", "hybrid"}:
+            q_embedding = embed_query(
+                question,
+                provider="ollama",
+                model=EMBED_MODEL,
+                base_url=OLLAMA_BASE_URL,
+            )
 
-        documents, metadatas, distances = query_collection(
+        documents, metadatas, distances = retrieve(
             collection=collection,
+            query_text=question,
             query_embedding=q_embedding,
             top_k=top_k,
+            method=retrieval_method,
+            chunks_path=CHUNKS_PATH,
+            hybrid_alpha=hybrid_alpha,
         )
 
         retrieved_sections = [
@@ -131,11 +140,29 @@ def main() -> None:
         default=DEFAULT_TOP_K,
         help="Number of chunks to retrieve per question",
     )
+    parser.add_argument(
+        "--retrieval-method",
+        choices=["dense", "sparse", "sparce", "hybrid"],
+        default="dense",
+        help="Retrieval method to evaluate.",
+    )
+    parser.add_argument(
+        "--hybrid-alpha",
+        type=float,
+        default=0.5,
+        help="Hybrid weighting: alpha*dense + (1-alpha)*sparse.",
+    )
     args = parser.parse_args()
+
+    retrieval_method = str(args.retrieval_method).strip().lower()
+    if retrieval_method == "sparce":
+        retrieval_method = "sparse"
 
     evaluate_retrieval(
         eval_file=args.eval_file,
         top_k=args.top_k,
+        retrieval_method=retrieval_method,
+        hybrid_alpha=float(args.hybrid_alpha),
     )
 
 

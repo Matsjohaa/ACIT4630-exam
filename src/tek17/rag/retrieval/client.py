@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from typing import Any
+from typing import Literal
 
 import chromadb
 from chromadb.config import Settings
@@ -15,6 +16,9 @@ logging.getLogger("chromadb.telemetry.product.posthog").disabled = True
 
 
 _collection_cache: dict[tuple[Path, str], chromadb.Collection] = {}
+
+
+RetrievalMethod = Literal["dense", "hybrid", "sparse", "sparce"]
 
 
 def get_collection(chroma_dir: Path, collection_name: str) -> chromadb.Collection:
@@ -61,3 +65,54 @@ def query_collection(
     distances = results["distances"][0] if results.get("distances") else []
 
     return documents, metadatas, distances
+
+
+def retrieve(
+    *,
+    collection: chromadb.Collection,
+    query_text: str,
+    query_embedding: list[float] | None,
+    top_k: int,
+    method: RetrievalMethod = "dense",
+    chunks_path: Path | None = None,
+    hybrid_alpha: float = 0.5,
+) -> tuple[list[str], list[dict[str, Any]], list[float]]:
+    """Retrieve documents using the selected retrieval method.
+
+    Returns (documents, metadatas, distances) where lower distance is better.
+    """
+
+    m = (method or "dense").strip().lower()
+    # Backwards-compatible alias (older code used 'sparce')
+    if m == "sparce":
+        m = "sparse"
+
+    if m == "dense":
+        if query_embedding is None:
+            raise ValueError("query_embedding is required for dense retrieval")
+        return query_collection(collection=collection, query_embedding=query_embedding, top_k=top_k)
+
+    if m == "sparse":
+        if chunks_path is None:
+            raise ValueError("chunks_path is required for sparse retrieval")
+        from tek17.rag.retrieval.methods.sparse import retrieve_sparce
+
+        return retrieve_sparce(query_text=query_text, top_k=top_k, chunks_path=chunks_path)
+
+    if m == "hybrid":
+        if query_embedding is None:
+            raise ValueError("query_embedding is required for hybrid retrieval")
+        if chunks_path is None:
+            raise ValueError("chunks_path is required for hybrid retrieval")
+        from tek17.rag.retrieval.methods.hybrid import retrieve_hybrid
+
+        return retrieve_hybrid(
+            collection=collection,
+            query_text=query_text,
+            query_embedding=query_embedding,
+            top_k=top_k,
+            alpha=hybrid_alpha,
+            chunks_path=chunks_path,
+        )
+
+    raise ValueError(f"Unknown retrieval method: {method}")
