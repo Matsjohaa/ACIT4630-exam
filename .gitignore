@@ -8,8 +8,12 @@ data/
 # Vector store (local DB)
 data/vectorstore/
 
-# Analysis logs (generated)
-analysis/logging/
+# Analysis
+# Keep analysis code + question sets in git. Ignore most generated logging artifacts
+# by default, but allow the refusal benchmark outputs to be committed.
+analysis/logging/*
+!analysis/logging/refusal_*.jsonl
+!analysis/logging/refusal_*.csv
 
 # Environment variables
 .env
