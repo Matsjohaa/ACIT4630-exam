@@ -5,6 +5,12 @@ venv/
 # Data (raw + processed)
 data/
 
+# Vector store (local DB)
+data/vectorstore/
+
+# Analysis logs (generated)
+analysis/logging/
+
 # Environment variables
 .env
 

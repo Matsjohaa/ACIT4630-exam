@@ -1,6 +1,10 @@
 import typer
 from pathlib import Path
 
+from tek17.rag.config import EMBED_MODEL as _CONFIG_EMBED_MODEL
+from tek17.rag.config import EMBED_PROVIDER as _CONFIG_EMBED_PROVIDER
+from tek17.rag.config import OLLAMA_BASE_URL as _CONFIG_OLLAMA_BASE_URL
+
 # ---------------------------------------------------------------------------
 # Lazy-import constants for CLI defaults.
 # Heavy dependencies (chromadb, etc.) are imported inside commands to keep
@@ -13,8 +17,9 @@ _DEFAULT_ROOT_PRINT_URL = (
 _DEFAULT_JSONL_PATH = Path("data/processed/tek17_dibk.jsonl")
 _DEFAULT_CHROMA_DIR = Path("data/vectorstore/chroma")
 _COLLECTION_NAME = "tek17"
-_EMBED_MODEL = "nomic-embed-text"
-_OLLAMA_BASE_URL = "http://localhost:11434"
+_EMBED_MODEL = _CONFIG_EMBED_MODEL
+_EMBED_PROVIDER = _CONFIG_EMBED_PROVIDER
+_OLLAMA_BASE_URL = _CONFIG_OLLAMA_BASE_URL
 _CHUNK_SIZE = 800
 _CHUNK_OVERLAP = 200
 
@@ -130,15 +135,20 @@ def ingest(
         "--chunk-overlap",
         help="Overlap between chunks.",
     ),
+    embed_provider: str = typer.Option(
+        _EMBED_PROVIDER,
+        "--embed-provider",
+        help="Embedding provider: 'ollama' (default) or 'openai'.",
+    ),
     embed_model: str = typer.Option(
         _EMBED_MODEL,
         "--embed-model",
-        help="Ollama embedding model name.",
+        help="Embedding model name (Ollama or OpenAI).",
     ),
     ollama_url: str = typer.Option(
         _OLLAMA_BASE_URL,
         "--ollama-url",
-        help="Ollama server URL.",
+        help="Ollama server URL (used when --embed-provider=ollama).",
     ),
 ) -> None:
     """
@@ -159,6 +169,7 @@ def ingest(
         collection_name=collection,
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
+        embed_provider=embed_provider,
         embed_model=embed_model,
         ollama_url=ollama_url,
     )
