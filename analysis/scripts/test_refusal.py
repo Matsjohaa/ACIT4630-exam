@@ -30,11 +30,13 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Literal
 
-from tek17.rag.prompts import SYSTEM_PROMPT
+from tek17.rag.prompts import SYSTEM_PROMPT, SYSTEM_PROMPT_SHA256
+from tek17.rag.config import PROMPT_VERSION
 
 
 DEFAULT_SERVER_URL = "http://localhost:8000"
@@ -90,8 +92,8 @@ def _has_refusal_tag(answer: str) -> bool:
     text = (answer or "").strip().lower()
     if not text:
         return False
-    # Allow the model to wrap it in quotes.
-    return "kan_ikke_svare:" in text
+    # Allow the model to wrap it in quotes and/or omit the colon.
+    return "kan_ikke_svare" in text
 
 
 def _classify_refusal(answer: str) -> bool:
@@ -127,6 +129,84 @@ def _classify_refusal(answer: str) -> bool:
         "outside the scope",
     ]
     return any(p in text for p in patterns)
+
+
+_STOPWORDS = {
+    "og",
+    "eller",
+    "som",
+    "med",
+    "for",
+    "til",
+    "av",
+    "på",
+    "i",
+    "jf",
+    "kapittel",
+    "paragraf",
+    "ledd",
+    "bokstav",
+    "gjelder",
+    "skal",
+    "kan",
+    "må",
+    "ikke",
+    "det",
+    "den",
+    "de",
+    "et",
+    "en",
+    "er",
+    "å",
+    "når",
+    "hva",
+    "hvordan",
+    "hvilke",
+    "hvilken",
+    "hvor",
+    "jeg",
+    "du",
+    "vi",
+    "man",
+    "teK17".lower(),
+}
+
+
+def _content_words(text: str) -> set[str]:
+    t = (text or "").lower()
+    # Keep letters (incl. Norwegian) and digits.
+    t = re.sub(r"[^0-9a-zæøå]+", " ", t)
+    words = {w for w in t.split() if len(w) >= 4 and w not in _STOPWORDS}
+    return words
+
+
+def _groundedness_score(answer: str, sources: list[dict[str, Any]]) -> float:
+    """Heuristic grounding score in [0,1].
+
+    Measures overlap between answer content-words and retrieved context text.
+    This is intentionally lightweight: it won't prove correctness, but it *will*
+    catch many cases where the model answers confidently without using the context.
+    """
+
+    a_words = _content_words(answer)
+    if not a_words:
+        return 0.0
+
+    ctx_parts: list[str] = []
+    for s in sources or []:
+        txt = (s or {}).get("text")
+        if isinstance(txt, str) and txt.strip():
+            ctx_parts.append(txt)
+
+    if not ctx_parts:
+        return 0.0
+
+    c_words = _content_words("\n".join(ctx_parts))
+    if not c_words:
+        return 0.0
+
+    overlap = len(a_words.intersection(c_words))
+    return overlap / max(1, len(a_words))
 
 
 def _safe_div(num: float, den: float) -> float:
@@ -214,7 +294,7 @@ def _query_server(question: str, cfg: RunConfig) -> dict[str, Any]:
 
 def _query_local(question: str, cfg: RunConfig) -> dict[str, Any]:
     from tek17.rag.embedding.client import embed_query
-    from tek17.rag.llm.client import chat
+    from tek17.rag.llm.client import chat_result
     from tek17.rag.retrieval.client import get_collection, retrieve
 
     collection = get_collection(cfg.chroma_dir, cfg.collection)
@@ -267,13 +347,14 @@ def _query_local(question: str, cfg: RunConfig) -> dict[str, Any]:
         {"role": "user", "content": user_msg},
     ]
 
-    answer = chat(
+    result = chat_result(
         messages,
         provider=cfg.llm_provider,
         model=cfg.llm_model,
         base_url=cfg.ollama_url,
         temperature=cfg.temperature if cfg.temperature is not None else 0.3,
     )
+    answer = result.content
 
     return {
         "answer": answer,
@@ -281,6 +362,8 @@ def _query_local(question: str, cfg: RunConfig) -> dict[str, Any]:
         "model": cfg.llm_model,
         "question": question,
         "retrieval_method": cfg.retrieval_method,
+        "llm_finish_reason": result.finish_reason,
+        "llm_usage": result.usage,
     }
 
 
@@ -344,12 +427,54 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
     total = 0
     correct = 0
 
+    # Lightweight answer correctness rubric (see below):
+    # - For should_refuse items: correct iff model_refused
+    # - For in-scope items: correct iff model did NOT refuse AND retrieved at least one target section
+    #   (this intentionally flags "non-refusal hallucinations" where the model answers without support)
+    correct_answer = 0
+    incorrect_answer = 0
+    unsupported_non_refusal = 0
+    ungrounded_non_refusal = 0
+    correct_answer_strict = 0
+    incorrect_answer_strict = 0
+    query_failed = 0
+
     tp_refuse = fp_refuse = tn_refuse = fn_refuse = 0
     # Stratified by retrieval hit
     tp_hit = fp_hit = tn_hit = fn_hit = 0
     tp_miss = fp_miss = tn_miss = fn_miss = 0
 
+    # Split refusal questions by refusal_type (optional field on dataset items)
+    refuse_type_counts: dict[str, int] = {}
+    refuse_type_refused: dict[str, int] = {}
+
     rows_out: list[dict[str, Any]] = []
+
+    # Vectorstore snapshot (local mode only; cached in the client)
+    vs_snapshot: dict[str, Any] | None = None
+    if cfg.mode == "local":
+        try:
+            from tek17.rag.retrieval.client import vectorstore_snapshot
+
+            vs_snapshot = vectorstore_snapshot(cfg.chroma_dir, cfg.collection)
+        except Exception:
+            vs_snapshot = None
+    else:
+        # Best-effort: fetch count from the server
+        try:
+            import requests
+
+            stats = requests.get(f"{cfg.server_url}/collection/stats", timeout=10).json()
+            if isinstance(stats, dict) and "count" in stats:
+                vs_snapshot = {
+                    "chroma_dir": None,
+                    "collection": stats.get("collection"),
+                    "count": stats.get("count"),
+                    "sqlite_sha256": None,
+                    "sqlite_size": None,
+                }
+        except Exception:
+            vs_snapshot = None
 
     print(f"mode: {cfg.mode}")
     if cfg.mode == "server":
@@ -364,6 +489,16 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
         question = str(item.get("question", "")).strip()
         target_sections = item.get("target_sections") or []
         should_refuse = bool(item.get("should_refuse", False))
+        question_type = item.get("question_type")
+        if isinstance(question_type, str):
+            question_type = question_type.strip() or None
+        else:
+            question_type = None
+        refusal_type = item.get("refusal_type")
+        if isinstance(refusal_type, str):
+            refusal_type = refusal_type.strip() or None
+        else:
+            refusal_type = None
 
         if not question:
             continue
@@ -373,29 +508,111 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
         try:
             data = _run_query(question, cfg)
         except Exception as exc:
+            query_failed += 1
+            incorrect_answer += 1
             print(f"{qid}\t{should_refuse}\tERROR\t0\tquery_failed: {exc}")
+            if out is not None:
+                rows_out.append(
+                    {
+                        "prompt_version": PROMPT_VERSION,
+                        "system_prompt_sha256": SYSTEM_PROMPT_SHA256,
+                        "id": qid,
+                        "question": question,
+                        "question_type": question_type,
+                        "should_refuse": should_refuse,
+                        "refusal_type": refusal_type,
+                        "model_refused": None,
+                        "refused_tagged": None,
+                        "refused_heuristic": None,
+                        "status": "query_failed",
+                        "retrieval_hit": None,
+                        "answer_correct": False,
+                        "answer_correct_strict": False,
+                        "answer_supported": None,
+                        "unsupported_non_refusal": False,
+                        "ungrounded_non_refusal": False,
+                        "groundedness_score": None,
+                        "answer_grounded": None,
+                        "target_sections": target_sections,
+                        "answer": None,
+                        "sources": None,
+                        "llm_finish_reason": None,
+                        "llm_usage": None,
+                        "error": str(exc),
+                        "mode": cfg.mode,
+                        "top_k": cfg.top_k,
+                        "retrieval_method": cfg.retrieval_method,
+                        "hybrid_alpha": cfg.hybrid_alpha,
+                        "model": (cfg.model if cfg.mode == "server" else cfg.llm_model),
+                        "temperature": cfg.temperature,
+                        "embed_provider": (cfg.embed_provider if cfg.mode == "local" else None),
+                        "embed_model": (cfg.embed_model if cfg.mode == "local" else None),
+                        "vectorstore": vs_snapshot,
+                    }
+                )
             continue
 
         answer = data.get("answer", "")
         sources = data.get("sources", []) or []
+
+        llm_finish_reason = data.get("llm_finish_reason")
+        llm_usage = data.get("llm_usage")
 
         retrieval_hit = _retrieval_hit(sources, list(target_sections) if isinstance(target_sections, list) else [])
         refused_tagged = _has_refusal_tag(answer)
         refused_heuristic = _classify_refusal(answer)
         model_refused = refused_tagged or refused_heuristic
 
+        status = ""
+
+        groundedness = _groundedness_score(answer, sources)
+        grounded = groundedness >= 0.25
+
+        # Lightweight correctness/support labels.
+        if should_refuse:
+            answer_correct = bool(model_refused)
+            answer_supported: bool | None = None
+            answer_correct_strict = bool(model_refused)
+        else:
+            if model_refused:
+                answer_correct = False
+                answer_supported = None
+                answer_correct_strict = False
+            else:
+                answer_supported = bool(retrieval_hit)
+                answer_correct = bool(retrieval_hit)
+                # Strict: require both retrieval_hit AND that the answer appears grounded in retrieved text.
+                answer_correct_strict = bool(retrieval_hit) and bool(grounded)
+
+        if (not should_refuse) and (not model_refused) and retrieval_hit and (not grounded):
+            ungrounded_non_refusal += 1
+            status = "ungrounded_answer"
+
+        if (not should_refuse) and (not model_refused) and (not retrieval_hit):
+            unsupported_non_refusal += 1
+            status = "unsupported_answer"
+
         if should_refuse and model_refused:
             tp_refuse += 1
             status = "correct_refusal"
         elif (not should_refuse) and (not model_refused):
             tn_refuse += 1
-            status = "correct_answer"
+            # If we already flagged this as unsupported, keep that.
+            if status != "unsupported_answer":
+                status = "correct_answer"
         elif (not should_refuse) and model_refused:
             fp_refuse += 1
             status = "over_refusal"
         else:
             fn_refuse += 1
             status = "under_refusal"
+
+        # Track refusal behaviour by refusal_type.
+        if should_refuse:
+            key = refusal_type or "(unspecified)"
+            refuse_type_counts[key] = refuse_type_counts.get(key, 0) + 1
+            if model_refused:
+                refuse_type_refused[key] = refuse_type_refused.get(key, 0) + 1
 
         if retrieval_hit:
             if should_refuse and model_refused:
@@ -419,28 +636,54 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
         if (should_refuse and model_refused) or ((not should_refuse) and (not model_refused)):
             correct += 1
 
+        if answer_correct:
+            correct_answer += 1
+        else:
+            incorrect_answer += 1
+
+        if answer_correct_strict:
+            correct_answer_strict += 1
+        else:
+            incorrect_answer_strict += 1
+
         print(f"{qid}\t{should_refuse}\t{model_refused}\t{int(retrieval_hit)}\t{status}")
 
         if out is not None:
             rows_out.append(
                 {
+                    "prompt_version": PROMPT_VERSION,
+                    "system_prompt_sha256": SYSTEM_PROMPT_SHA256,
                     "id": qid,
                     "question": question,
+                    "question_type": question_type,
                     "should_refuse": should_refuse,
+                    "refusal_type": refusal_type,
                     "model_refused": model_refused,
                     "refused_tagged": refused_tagged,
                     "refused_heuristic": refused_heuristic,
                     "status": status,
                     "retrieval_hit": retrieval_hit,
+                    "answer_correct": answer_correct,
+                    "answer_correct_strict": answer_correct_strict,
+                    "answer_supported": answer_supported,
+                    "unsupported_non_refusal": (not should_refuse) and (not model_refused) and (not retrieval_hit),
+                    "ungrounded_non_refusal": (not should_refuse) and (not model_refused) and bool(retrieval_hit) and (not grounded),
+                    "groundedness_score": groundedness,
+                    "answer_grounded": grounded if (not should_refuse) and (not model_refused) else None,
                     "target_sections": target_sections,
                     "answer": answer,
                     "sources": sources,
+                    "llm_finish_reason": llm_finish_reason,
+                    "llm_usage": llm_usage,
                     "mode": cfg.mode,
                     "top_k": cfg.top_k,
                     "retrieval_method": cfg.retrieval_method,
                     "hybrid_alpha": cfg.hybrid_alpha,
                     "model": data.get("model", cfg.model or cfg.llm_model),
                     "temperature": cfg.temperature,
+                    "embed_provider": (cfg.embed_provider if cfg.mode == "local" else None),
+                    "embed_model": (cfg.embed_model if cfg.mode == "local" else None),
+                    "vectorstore": vs_snapshot,
                 }
             )
 
@@ -467,6 +710,20 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
         print(f"  MCC                        : {metrics['mcc']:.3f}")
         print(f"  Refusal rate (pred / true) : {metrics['refusal_rate_pred']:.3f} / {metrics['refusal_rate_true']:.3f}")
 
+        print()
+        correctness_acc = (correct_answer / total) if total else 0.0
+        corr_lo, corr_hi = _wilson_ci(correct_answer, total)
+        print("Lightweight answer correctness (support-based):")
+        print(f"  accuracy                  : {correctness_acc:.3f} (95% CI {corr_lo:.3f}–{corr_hi:.3f})")
+        print(f"  unsupported_non_refusals   : {unsupported_non_refusal} ({(unsupported_non_refusal/total):.3f} of all items)")
+        print(f"  ungrounded_non_refusals    : {ungrounded_non_refusal} ({(ungrounded_non_refusal/total):.3f} of all items)")
+        print(f"  query_failed               : {query_failed} ({(query_failed/total):.3f} of all items)")
+
+        strict_acc = (correct_answer_strict / total) if total else 0.0
+        strict_lo, strict_hi = _wilson_ci(correct_answer_strict, total)
+        print("Strict answer correctness (retrieval_hit + groundedness):")
+        print(f"  accuracy                  : {strict_acc:.3f} (95% CI {strict_lo:.3f}–{strict_hi:.3f})")
+
         # Stratified metrics can help distinguish retrieval issues from refusal logic.
         n_hit = tp_hit + fp_hit + tn_hit + fn_hit
         n_miss = tp_miss + fp_miss + tn_miss + fn_miss
@@ -477,6 +734,15 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
             print("Breakdown by retrieval_hit:")
             print(f"  retrieval_hit=1 (n={n_hit}) acc={m_hit['accuracy']:.3f} f1={m_hit['f1']:.3f} mcc={m_hit['mcc']:.3f}")
             print(f"  retrieval_hit=0 (n={n_miss}) acc={m_miss['accuracy']:.3f} f1={m_miss['f1']:.3f} mcc={m_miss['mcc']:.3f}")
+
+        if refuse_type_counts:
+            print()
+            print("Refusal questions by refusal_type:")
+            for k in sorted(refuse_type_counts.keys()):
+                n_k = refuse_type_counts[k]
+                refused_k = refuse_type_refused.get(k, 0)
+                rate_k = (refused_k / n_k) if n_k else 0.0
+                print(f"  {k}: n={n_k} refused={refused_k} rate={rate_k:.3f}")
 
     if out is not None:
         _write_jsonl(out, rows_out)

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import logging
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from typing import Literal
@@ -19,6 +21,45 @@ _collection_cache: dict[tuple[Path, str], chromadb.Collection] = {}
 
 
 RetrievalMethod = Literal["dense", "hybrid", "sparse", "sparce"]
+
+
+def _sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+@lru_cache(maxsize=16)
+def vectorstore_snapshot(chroma_dir: Path, collection_name: str) -> dict[str, Any]:
+    """Return a lightweight snapshot of the vector store for reproducibility.
+
+    Includes the collection count and a stable fingerprint of Chroma's
+    `chroma.sqlite3` file (when present).
+    """
+
+    col = get_collection(chroma_dir, collection_name)
+    count = col.count()
+
+    sqlite_path = chroma_dir / "chroma.sqlite3"
+    sqlite_sha256: str | None = None
+    sqlite_size: int | None = None
+
+    if sqlite_path.exists() and sqlite_path.is_file():
+        sqlite_sha256 = _sha256_file(sqlite_path)
+        sqlite_size = sqlite_path.stat().st_size
+
+    return {
+        "chroma_dir": str(chroma_dir.resolve()),
+        "collection": collection_name,
+        "count": int(count),
+        "sqlite_sha256": sqlite_sha256,
+        "sqlite_size": sqlite_size,
+    }
 
 
 def get_collection(chroma_dir: Path, collection_name: str) -> chromadb.Collection:

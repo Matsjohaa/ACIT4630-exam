@@ -86,6 +86,10 @@ OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")  # for Azure / custom endpoints
 # LLM defaults
 # ---------------------------------------------------------------------------
 
+# Optional human-readable prompt version label (helps compare runs across
+# prompt edits). If unset, only prompt hashes are logged.
+PROMPT_VERSION = os.getenv("TEK17_PROMPT_VERSION", "").strip() or None
+
 LLM_PROVIDER = os.getenv("TEK17_LLM_PROVIDER", "ollama")
 LLM_MODEL = os.getenv("TEK17_LLM_MODEL", "llama3.2")
 

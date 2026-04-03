@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import textwrap
 
 
@@ -24,3 +25,8 @@ SYSTEM_PROMPT = textwrap.dedent(
         Altinn/byggesøknadsskjema, klageprosess, eller SAK10/pbl-vilkår utover det som står eksplisitt i konteksten.
     """
 )
+
+
+# Stable fingerprint of the system prompt so eval logs can be compared
+# across prompt iterations without storing the full prompt in every row.
+SYSTEM_PROMPT_SHA256 = hashlib.sha256(SYSTEM_PROMPT.encode("utf-8")).hexdigest()

@@ -52,6 +52,10 @@ def _classify_refusal(answer: str) -> bool:
 
     text = answer.lower()
 
+    # Explicit refusal tag used by this project.
+    if "kan_ikke_svare" in text:
+        return True
+
     # Norwegian-ish refusal patterns – adjust as needed for your eval set.
     patterns = [
         "kan ikke svare",

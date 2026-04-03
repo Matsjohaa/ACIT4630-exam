@@ -21,8 +21,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from tek17.rag.embedding.client import embed_query
-from tek17.rag.llm.client import chat
-from tek17.rag.prompts import SYSTEM_PROMPT
+from tek17.rag.llm.client import chat_result
+from tek17.rag.prompts import SYSTEM_PROMPT, SYSTEM_PROMPT_SHA256
 from tek17.rag.retrieval.client import get_collection, retrieve
 from tek17.rag.config import (
     CHROMA_DIR,
@@ -39,7 +39,9 @@ from tek17.rag.config import (
     TOP_K,
     RETRIEVAL_METHOD,
     HYBRID_ALPHA,
+    PROMPT_VERSION,
 )
+from tek17.rag.retrieval.client import vectorstore_snapshot
 
 # ---------------------------------------------------------------------------
 # FastAPI app
@@ -137,6 +139,12 @@ def query(req: QueryRequest):
     except Exception as e:
         raise HTTPException(status_code=503, detail=str(e))
 
+    # Vectorstore snapshot for reproducibility (cached)
+    try:
+        vs_snapshot = vectorstore_snapshot(CHROMA_DIR, CHROMA_COLLECTION)
+    except Exception:
+        vs_snapshot = None
+
     retrieval_method = (req.retrieval_method or RETRIEVAL_METHOD).strip().lower()
     if retrieval_method == "sparce":
         retrieval_method = "sparse"
@@ -178,11 +186,54 @@ def query(req: QueryRequest):
 
     context_block = "\n\n---\n\n".join(context_parts)
 
+    provider = (req.provider or LLM_PROVIDER).strip().lower()
+    if provider not in {"ollama", "openai"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid provider. Must be 'ollama' or 'openai'.",
+        )
+
+    max_tokens = req.max_tokens if req.max_tokens is not None else LLM_MAX_TOKENS
+
     if not context_block.strip():
         answer = (
             'KAN_IKKE_SVARE: Jeg har ikke nok informasjon i RAG-databasen/konteksten '
             'til å gi et konkret svar på dette spørsmålet.'
         )
+
+        # Best-effort structured logging for refusal / retrieval analysis
+        event = {
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "prompt_version": PROMPT_VERSION,
+            "system_prompt_sha256": SYSTEM_PROMPT_SHA256,
+            "question": req.question,
+            "top_k": req.top_k,
+            "retrieval_method": retrieval_method,
+            "hybrid_alpha": req.hybrid_alpha,
+            "embed_provider": EMBED_PROVIDER,
+            "embed_model": EMBED_MODEL,
+            "vectorstore": vs_snapshot,
+            "provider": provider,
+            "model": req.model,
+            "temperature": req.temperature,
+            "max_tokens": max_tokens,
+            "retrieved": [
+                {
+                    "section_id": s.section_id,
+                    "title": s.title,
+                    "chapter": s.chapter,
+                    "text_type": s.text_type,
+                    "distance": s.distance,
+                }
+                for s in sources
+            ],
+            "context": context_block,
+            "answer": answer,
+            "llm_finish_reason": None,
+            "llm_usage": None,
+        }
+        _log_query_event(event)
+
         return QueryResponse(
             answer=answer,
             sources=sources,
@@ -201,15 +252,7 @@ def query(req: QueryRequest):
     ]
 
     try:
-        provider = (req.provider or LLM_PROVIDER).strip().lower()
-        if provider not in {"ollama", "openai"}:
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid provider. Must be 'ollama' or 'openai'.",
-            )
-
-        max_tokens = req.max_tokens if req.max_tokens is not None else LLM_MAX_TOKENS
-        answer = chat(
+        result = chat_result(
             messages,
             provider=provider,  # type: ignore[arg-type]
             model=req.model,
@@ -217,18 +260,26 @@ def query(req: QueryRequest):
             temperature=req.temperature,
             max_tokens=max_tokens,
         )
+        answer = result.content
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"LLM provider error: {e}")
 
     # Best-effort structured logging for refusal / retrieval analysis
     event = {
         "timestamp": datetime.utcnow().isoformat() + "Z",
+        "prompt_version": PROMPT_VERSION,
+        "system_prompt_sha256": SYSTEM_PROMPT_SHA256,
         "question": req.question,
         "top_k": req.top_k,
         "retrieval_method": retrieval_method,
         "hybrid_alpha": req.hybrid_alpha,
+        "embed_provider": EMBED_PROVIDER,
+        "embed_model": EMBED_MODEL,
+        "vectorstore": vs_snapshot,
+        "provider": provider,
         "model": req.model,
         "temperature": req.temperature,
+        "max_tokens": max_tokens,
         "retrieved": [
             {
                 "section_id": s.section_id,
@@ -241,6 +292,8 @@ def query(req: QueryRequest):
         ],
         "context": context_block,
         "answer": answer,
+        "llm_finish_reason": result.finish_reason,
+        "llm_usage": result.usage,
     }
     _log_query_event(event)
 

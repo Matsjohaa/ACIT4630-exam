@@ -1,20 +1,23 @@
 from __future__ import annotations
 
 import os
+from typing import Any
 
 from tek17.rag.config import OPENAI_API_KEY, OPENAI_BASE_URL
 
 
-def openai_chat(
+def openai_chat_result(
 	messages: list[dict[str, str]],
 	model: str,
 	temperature: float,
 	max_tokens: int | None,
-) -> str:
-	"""Chat completion via OpenAI.
+) -> dict[str, Any]:
+	"""Chat completion via OpenAI, returning content + metadata.
 
-	Expects an API key in OPENAI_API_KEY or OPEN_AI_API_KEY.
-	If OPENAI_BASE_URL is set, it will be used (Azure/custom endpoints).
+	Returns a dict containing:
+	- content: str
+	- finish_reason: str | None
+	- usage: dict | None (prompt_tokens/completion_tokens/total_tokens)
 	"""
 
 	api_key = OPENAI_API_KEY or os.getenv("OPENAI_API_KEY") or os.getenv("OPEN_AI_API_KEY")
@@ -44,5 +47,37 @@ def openai_chat(
 		kwargs["max_tokens"] = max_tokens
 
 	resp = client.chat.completions.create(**kwargs)
-	return resp.choices[0].message.content or ""
+	choice = resp.choices[0]
+	content = (choice.message.content or "") if choice.message else ""
+	finish_reason = getattr(choice, "finish_reason", None)
+
+	usage: dict[str, int] | None = None
+	if getattr(resp, "usage", None) is not None:
+		u = resp.usage
+		usage = {
+			"prompt_tokens": int(getattr(u, "prompt_tokens", 0) or 0),
+			"completion_tokens": int(getattr(u, "completion_tokens", 0) or 0),
+			"total_tokens": int(getattr(u, "total_tokens", 0) or 0),
+		}
+
+	return {
+		"content": content,
+		"finish_reason": finish_reason,
+		"usage": usage,
+	}
+
+
+def openai_chat(
+	messages: list[dict[str, str]],
+	model: str,
+	temperature: float,
+	max_tokens: int | None,
+) -> str:
+	"""Chat completion via OpenAI.
+
+	Expects an API key in OPENAI_API_KEY or OPEN_AI_API_KEY.
+	If OPENAI_BASE_URL is set, it will be used (Azure/custom endpoints).
+	"""
+
+	return str(openai_chat_result(messages, model=model, temperature=temperature, max_tokens=max_tokens)["content"])
 

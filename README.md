@@ -4,6 +4,7 @@ RAG system for TEK17 (Byggteknisk forskrift) with:
 
 - A reproducible TEK17 corpus pipeline (download → parse → chunks)
 - Local ChromaDB vector store and Ollama-based LLM
+- Multiple retrieval techniques (dense / sparse / hybrid)
 - Evaluation of retrieval quality and refusal behaviour
 
 The goal is that anyone in the group can:
@@ -112,7 +113,7 @@ When a user asks a question (via UI or API):
 3. **Context building** – the retrieved chunks are concatenated into a context block.
 4. **LLM call** – the context + question are sent to the LLM (Ollama `llama3.2` by default).
 5. **Response** – the API returns the answer and the list of source chunks (with §, title, chapter, etc.).
-6. **Logging** – each `/query` call is written to `analysis/logging/rag_queries.jsonl` for later analysis.
+6. **Logging** – each `/query` call is written to `analysis/logging/rag_queries.jsonl` for later analysis. In addition, the headless eval scripts under `analysis/scripts/` write per-run JSONL logs and summary CSVs under `analysis/logging/`.
 
 This makes it possible to inspect exactly what the model saw when it answered or refused.
 
@@ -142,6 +143,7 @@ src/tek17/
 └── rag/                  # RAG stack (embeddings, retrieval, LLM, eval)
     ├── __init__.py
     ├── config.py         # Central configuration (paths, models, etc.)
+    ├── prompts.py        # System prompt + prompt hash for provenance
     ├── ingest.py         # Orchestrate chunking → embeddings → ChromaDB
     ├── server.py         # FastAPI RAG server with /query, /models, /stats
     ├── embedding/
@@ -150,7 +152,11 @@ src/tek17/
     │   └── chroma_ingest.py # Read chunks, embed and upsert into Chroma
     ├── retrieval/
     │   ├── __init__.py
-    │   └── client.py     # Chroma client and query wrapper
+    │   ├── client.py     # Retrieval dispatcher + vectorstore snapshot fingerprinting
+    │   └── methods/      # Retrieval implementations
+    │       ├── dense.py
+    │       ├── sparse.py
+    │       └── hybrid.py
     ├── llm/
     │   ├── __init__.py
     │   └── client.py     # LLM client (Ollama chat; multi-LLM ready)
@@ -172,11 +178,22 @@ data/
 
 analysis/
 ├── logging/
-│   └── rag_queries.jsonl     # One JSON object per /query request
+│   ├── rag_queries.jsonl     # One JSON object per /query request (server mode)
+│   ├── refusal_*.jsonl       # Headless eval outputs (local/server mode)
+│   └── *.csv                 # Aggregated summaries of eval runs
 └── questions/
     ├── README.md             # Evaluation schema and guidance
     ├── tek17_eval_questions.example.jsonl
     └── tek17_eval_questions.dibk_example.jsonl
+
+analysis/scripts/
+├── benchmark_refusal_models.py   # Runs a fixed 3-model refusal benchmark + summary CSV
+├── test_refusal.py               # Headless runner that writes JSONL logs
+├── summarize_refusal_runs.py     # Aggregates JSONL logs into metrics CSV
+├── generate_eval_questions.py    # Generates the auto question sets
+├── sweep_refusal.py              # Parameter sweep orchestrator (optional)
+├── compare_refusal_runs.py       # Diff two JSONL runs (optional)
+└── check_vectorstore.py          # Sanity check for ChromaDB contents
 ```
 
 ---
@@ -252,6 +269,80 @@ Two scripts (run as modules) help you measure performance:
    ```
 
 Both scripts print per-question results and simple summary metrics.
+
+### Headless evaluation (used for our benchmarks)
+
+For the experiments reported in this project, we primarily use the headless runners under `analysis/scripts/` because they:
+
+- work without starting the FastAPI server (local mode)
+- write one JSONL record per eval question (easy to audit)
+- can be summarized into a CSV for reporting
+
+Question set used for the model + retrieval benchmarks:
+
+- `analysis/questions/tek17_eval_questions.auto_v3_multistep.jsonl` (213 items)
+
+You can regenerate it (deterministically, given the TEK17 snapshot) with:
+
+```bash
+python analysis/scripts/generate_eval_questions.py \
+  --out analysis/questions/tek17_eval_questions.auto_v3_multistep.jsonl \
+  --n-in-scope 160 --n-refuse 80 --seed 17 --style paraphrase --multi-frac 0.25 --multi-max-sections 3
+```
+
+### Practical refusal benchmark (3 models, one retrieval method)
+
+For refusal-behaviour comparisons across LLM backends, the repo also includes
+a headless runner under `analysis/scripts/` that writes one JSONL per run and a
+single combined summary CSV:
+
+```bash
+python analysis/scripts/benchmark_refusal_models.py \
+  --eval-file analysis/questions/tek17_eval_questions.auto_v3_multistep.jsonl \
+  --retrieval-method dense --top-k 6 --temperature 0
+```
+
+Defaults:
+- Ollama: `llama3.2`
+- OpenAI: `gpt-4.1-mini` and `gpt-5.2` (override via `--openai-models`)
+
+### Practical retrieval benchmark (one model, multiple retrieval methods)
+
+To compare retrieval techniques while holding the LLM fixed (e.g. `gpt-4.1-mini`), run `analysis/scripts/test_refusal.py` once per retrieval method and then summarize:
+
+```bash
+# Dense
+python analysis/scripts/test_refusal.py \
+  --mode local \
+  --eval-file analysis/questions/tek17_eval_questions.auto_v3_multistep.jsonl \
+  --llm-provider openai --llm-model gpt-4.1-mini \
+  --retrieval-method dense --top-k 6 --temperature 0 \
+  --out analysis/logging/refusal_retrieval_benchmark_openai_gpt-4.1-mini_dense_top6_t0.jsonl
+
+# Sparse (BM25)
+python analysis/scripts/test_refusal.py \
+  --mode local \
+  --eval-file analysis/questions/tek17_eval_questions.auto_v3_multistep.jsonl \
+  --llm-provider openai --llm-model gpt-4.1-mini \
+  --retrieval-method sparse --top-k 6 --temperature 0 \
+  --out analysis/logging/refusal_retrieval_benchmark_openai_gpt-4.1-mini_sparse_top6_t0.jsonl
+
+# Hybrid
+python analysis/scripts/test_refusal.py \
+  --mode local \
+  --eval-file analysis/questions/tek17_eval_questions.auto_v3_multistep.jsonl \
+  --llm-provider openai --llm-model gpt-4.1-mini \
+  --retrieval-method hybrid --hybrid-alpha 0.5 --top-k 6 --temperature 0 \
+  --out analysis/logging/refusal_retrieval_benchmark_openai_gpt-4.1-mini_hybrid_top6_t0_a0.5.jsonl
+
+# Summarize into one CSV
+python analysis/scripts/summarize_refusal_runs.py \
+  --files \
+    analysis/logging/refusal_retrieval_benchmark_openai_gpt-4.1-mini_dense_top6_t0.jsonl \
+    analysis/logging/refusal_retrieval_benchmark_openai_gpt-4.1-mini_sparse_top6_t0.jsonl \
+    analysis/logging/refusal_retrieval_benchmark_openai_gpt-4.1-mini_hybrid_top6_t0_a0.5.jsonl \
+  --out-csv analysis/logging/refusal_retrieval_benchmark_openai_gpt-4.1-mini_top6_t0_summary.csv
+```
 
 ---
 
