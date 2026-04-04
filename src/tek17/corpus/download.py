@@ -47,15 +47,61 @@ def _sha256_bytes(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
 
+def _repo_root() -> Path:
+    """
+    Resolve repository root from this file location:
+    src/tek17/corpus/download.py -> repo root is parents[3]
+    """
+    return Path(__file__).resolve().parents[3]
+
+
+def _resolve_manifest_path(p: str, repo_root: Path) -> Path:
+    """
+    Resolve a manifest path robustly.
+
+    Supports:
+    - new relative paths stored from repo root, e.g.
+      data/raw/dibk_root_print/2026-03-13/tek17_full_root_print.html
+    - old absolute paths from the same machine
+    - old absolute paths from another machine, if the suffix from /data/... exists
+      in the current repo
+    """
+    path = Path(p)
+
+    if path.is_absolute():
+        if path.exists():
+            return path
+
+        # Fallback for old absolute paths from another machine:
+        # reconstruct from the first 'data' segment if present.
+        try:
+            parts = path.parts
+            if "data" in parts:
+                data_idx = parts.index("data")
+                rel_from_data = Path(*parts[data_idx:])
+                candidate = (repo_root / rel_from_data).resolve()
+                return candidate
+        except Exception:
+            pass
+
+        return path
+
+    return (repo_root / path).resolve()
+
+
 def _find_latest_snapshot_path(manifest_path: Path, url: str) -> Optional[Path]:
     """
     If the URL has already been downloaded, return the most recent snapshot path
     found in the manifest (last matching row wins).
+
+    Handles both old absolute manifest paths and new repo-relative paths.
     """
     if not manifest_path.exists():
         return None
 
+    repo_root = _repo_root()
     latest: Optional[Path] = None
+
     for line in manifest_path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
@@ -70,7 +116,7 @@ def _find_latest_snapshot_path(manifest_path: Path, url: str) -> Optional[Path]:
 
         p = r.get("path") or ""
         if p:
-            latest = Path(p)
+            latest = _resolve_manifest_path(p, repo_root)
 
     return latest if (latest and latest.exists()) else None
 
@@ -97,8 +143,15 @@ def run_download_root_print(
     If force=False and the URL already exists in the manifest, we skip downloading
     and return the latest existing snapshot path for that URL.
     """
-    out_dir = out_dir.resolve()
-    manifest_path = manifest_path.resolve()
+    repo_root = _repo_root()
+
+    out_dir = (repo_root / out_dir).resolve() if not out_dir.is_absolute() else out_dir.resolve()
+    manifest_path = (
+        (repo_root / manifest_path).resolve()
+        if not manifest_path.is_absolute()
+        else manifest_path.resolve()
+    )
+
     out_dir.mkdir(parents=True, exist_ok=True)
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -133,12 +186,20 @@ def run_download_root_print(
     if status == 200 and body:
         fpath.write_bytes(body)
 
+    stored_path = ""
+    if fpath.exists():
+        try:
+            stored_path = str(fpath.relative_to(repo_root))
+        except ValueError:
+            # Fallback if file somehow ends up outside repo root
+            stored_path = str(fpath)
+
     row = ManifestRow(
         url=url,
         final_url=final_url,
         status=status,
         downloaded_at=_now_iso(),
-        path=str(fpath) if fpath.exists() else "",
+        path=stored_path,
         sha256=sha,
         content_type=content_type,
     )
@@ -151,6 +212,8 @@ def run_download_root_print(
     print(f"Manifest: {manifest_path}")
 
     if not fpath.exists():
-        raise RuntimeError(f"Download failed or did not produce an HTML snapshot: status={status}")
+        raise RuntimeError(
+            f"Download failed or did not produce an HTML snapshot: status={status}"
+        )
 
     return fpath

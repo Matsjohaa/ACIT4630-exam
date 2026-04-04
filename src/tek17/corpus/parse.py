@@ -13,6 +13,48 @@ from bs4 import BeautifulSoup
 SECTION_ID_RE = re.compile(r"§\s*(\d{1,2}-\d{1,2}[a-zA-Z]?)")
 
 
+def _repo_root() -> Path:
+    """
+    Resolve repository root from this file location:
+    src/tek17/corpus/parse.py -> repo root is parents[3]
+    """
+    return Path(__file__).resolve().parents[3]
+
+
+def _resolve_manifest_path(p: str, repo_root: Path) -> Path:
+    """
+    Resolve a manifest path robustly.
+
+    Supports:
+    - new relative paths stored from repo root, e.g.
+      data/raw/dibk_root_print/2026-03-13/tek17_full_root_print.html
+    - old absolute paths from the same machine
+    - old absolute paths from another machine, if the suffix from /data/... exists
+      in the current repo
+    """
+    path = Path(p)
+
+    if path.is_absolute():
+        if path.exists():
+            return path
+
+        # Fallback for old absolute paths from another machine:
+        # reconstruct from the first 'data' segment if present.
+        try:
+            parts = path.parts
+            if "data" in parts:
+                data_idx = parts.index("data")
+                rel_from_data = Path(*parts[data_idx:])
+                candidate = (repo_root / rel_from_data).resolve()
+                return candidate
+        except Exception:
+            pass
+
+        return path
+
+    return (repo_root / path).resolve()
+
+
 def canonicalize_url(u: str) -> str:
     """
     Remove query params and fragments so URLs can be compared deterministically.
@@ -155,6 +197,15 @@ def run_parse_root_print(manifest_path: Path, out_path: Path) -> None:
     - chunking and retrieval experiments should preferably chunk reg/guidance separately
       to support ablation studies (reg-only vs reg+guidance retrieval).
     """
+    repo_root = _repo_root()
+
+    manifest_path = (
+        (repo_root / manifest_path).resolve()
+        if not manifest_path.is_absolute()
+        else manifest_path.resolve()
+    )
+    out_path = (repo_root / out_path).resolve() if not out_path.is_absolute() else out_path.resolve()
+
     # Select the most recent valid HTML snapshot (manifest is append-only; last match wins).
     chosen: Optional[ManifestRow] = None
     for row in iter_manifest(manifest_path):
@@ -164,7 +215,7 @@ def run_parse_root_print(manifest_path: Path, out_path: Path) -> None:
     if not chosen:
         raise RuntimeError("No valid HTML snapshot found in manifest.")
 
-    html_path = Path(chosen.path)
+    html_path = _resolve_manifest_path(chosen.path, repo_root)
     if not html_path.exists():
         raise FileNotFoundError(f"Snapshot missing: {html_path}")
 
