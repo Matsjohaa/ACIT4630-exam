@@ -360,6 +360,37 @@ python -m tek17 parse-dibk
 python -m tek17 ingest
 ```
 
+### Reproducibility of reported results
+
+There are two levels of reproducibility:
+
+1) **Exact reproduction of the reported numbers**
+
+If the run artifacts under `analysis/logging/` are available, the reported summary tables are fully reproducible by re-summarizing the same JSONL logs:
+
+```bash
+python analysis/scripts/summarize_refusal_runs.py \
+  --glob 'analysis/logging/refusal_*.jsonl' \
+  --out-csv analysis/logging/refusal_summary_recomputed.csv
+```
+
+This produces identical metrics because it is a deterministic aggregation of the logged per-question results.
+
+2) **Reproducing the same trends by re-running the experiments**
+
+The evaluation scripts are deterministic given the same inputs (eval question set + TEK17 snapshot + vectorstore contents) and fixed settings (e.g. `temperature=0`, `top_k=6`).
+However, results are not guaranteed to be *bit-for-bit identical* across machines/time because:
+
+- OpenAI models are external services and may change over time (even at `temperature=0`).
+- Ollama model tags/builds can differ between installations.
+- Rebuilding the vectorstore with different embedding model versions or chunking parameters changes retrieval and downstream refusal/answer behaviour.
+
+For re-running the same experiment suite, use the commands in sections 7 (headless evaluation) and keep:
+
+- `analysis/questions/tek17_eval_questions.auto_v3_multistep.jsonl`
+- the canonical TEK17 snapshot described below
+- the same embedding + LLM provider/model choices
+
 Canonical TEK17 snapshot used in this project:
 
 - **Root-print URL:** https://www.dibk.no/regelverk/byggteknisk-forskrift-tek17?subtype=root&print=true

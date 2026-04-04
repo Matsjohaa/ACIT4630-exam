@@ -559,9 +559,22 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
         llm_usage = data.get("llm_usage")
 
         retrieval_hit = _retrieval_hit(sources, list(target_sections) if isinstance(target_sections, list) else [])
+        retrieval_any = bool(sources)
         refused_tagged = _has_refusal_tag(answer)
         refused_heuristic = _classify_refusal(answer)
         model_refused = refused_tagged or refused_heuristic
+
+        # Extra explanatory categorization (kept separate from `status` so it
+        # doesn't affect existing summary metrics).
+        if should_refuse:
+            evidence_category = (
+                "retrieval_miss_correct_refusal" if model_refused else "under_refusal_no_evidence"
+            )
+        else:
+            if model_refused:
+                evidence_category = "over_refusal_with_evidence" if retrieval_hit else "over_refusal_without_evidence"
+            else:
+                evidence_category = "correct_answer" if retrieval_hit else "answer_without_evidence"
 
         status = ""
 
@@ -663,6 +676,8 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
                     "refused_heuristic": refused_heuristic,
                     "status": status,
                     "retrieval_hit": retrieval_hit,
+                    "retrieval_any": retrieval_any,
+                    "evidence_category": evidence_category,
                     "answer_correct": answer_correct,
                     "answer_correct_strict": answer_correct_strict,
                     "answer_supported": answer_supported,
