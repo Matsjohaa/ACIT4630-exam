@@ -6,51 +6,69 @@ import json
 from pathlib import Path
 from typing import Any
 
-from tek17.rag.config import ANALYSIS_DIR
+from tek17.rag.config import (
+    ANALYSIS_DIR,
+    CONDITIONAL_REFUSAL_CATEGORY_NAMES,
+)
 
 
 DEFAULT_LOG_DIR = ANALYSIS_DIR / "logging"
 DEFAULT_OUT_CSV = DEFAULT_LOG_DIR / "conditional_refusal_summary.csv"
 
-CATEGORY_NAMES = [
-    "retrieval_miss_correct_refusal",
-    "over_refusal_with_evidence",
-    "answer_without_evidence",
-    "correct_answer",
-    "correct_refusal_with_context",
-    "under_refusal_with_context",
-    "unsafe_answer_no_evidence",
-    "other",
-]
+
+def _coalesce_bool(row: dict[str, Any], *keys: str) -> bool | None:
+    for key in keys:
+        value = row.get(key)
+        if isinstance(value, bool):
+            return value
+    return None
 
 
-def classify_case(hit: bool, should_refuse: bool, model_refused: bool) -> str:
-    if not hit and should_refuse and model_refused:
+def classify_case(
+    any_hit: bool,
+    full_hit: bool,
+    partial_hit: bool,
+    should_refuse: bool,
+    model_refused: bool,
+) -> str:
+    if (not any_hit) and should_refuse and model_refused:
         return "retrieval_miss_correct_refusal"
-    if hit and not should_refuse and model_refused:
-        return "over_refusal_with_evidence"
-    if not hit and not should_refuse and not model_refused:
+    if partial_hit and (not should_refuse) and model_refused:
+        return "over_refusal_with_partial_evidence"
+    if full_hit and (not should_refuse) and model_refused:
+        return "over_refusal_with_full_evidence"
+    if (not any_hit) and (not should_refuse) and (not model_refused):
         return "answer_without_evidence"
-    if hit and not should_refuse and not model_refused:
+    if partial_hit and (not should_refuse) and (not model_refused):
+        return "partial_support_answer"
+    if full_hit and (not should_refuse) and (not model_refused):
         return "correct_answer"
-    if hit and should_refuse and model_refused:
-        return "correct_refusal_with_context"
-    if hit and should_refuse and not model_refused:
-        return "under_refusal_with_context"
-    if not hit and should_refuse and not model_refused:
+    if partial_hit and should_refuse and model_refused:
+        return "correct_refusal_with_partial_context"
+    if full_hit and should_refuse and model_refused:
+        return "correct_refusal_with_full_context"
+    if partial_hit and should_refuse and (not model_refused):
+        return "under_refusal_with_partial_context"
+    if full_hit and should_refuse and (not model_refused):
+        return "under_refusal_with_full_context"
+    if (not any_hit) and should_refuse and (not model_refused):
         return "unsafe_answer_no_evidence"
     return "other"
 
 
 def empty_category_counts() -> dict[str, int]:
-    return {name: 0 for name in CATEGORY_NAMES}
+    return {name: 0 for name in CONDITIONAL_REFUSAL_CATEGORY_NAMES}
 
 
 def summarize_run(path: Path) -> dict[str, Any] | None:
-    hit_refuse = 0
-    hit_total = 0
-    nohit_refuse = 0
-    nohit_total = 0
+    any_hit_refuse = 0
+    any_hit_total = 0
+    no_hit_refuse = 0
+    no_hit_total = 0
+    partial_hit_refuse = 0
+    partial_hit_total = 0
+    full_hit_refuse = 0
+    full_hit_total = 0
 
     model = None
     retrieval = None
@@ -58,6 +76,7 @@ def summarize_run(path: Path) -> dict[str, Any] | None:
     temperature = None
     mode = None
     hybrid_alpha = None
+    prompt_version = None
 
     category_counts = empty_category_counts()
     n_rows = 0
@@ -73,38 +92,72 @@ def summarize_run(path: Path) -> dict[str, Any] | None:
                 temperature = row.get("temperature")
                 mode = row.get("mode")
                 hybrid_alpha = row.get("hybrid_alpha")
+                prompt_version = row.get("prompt_version")
 
-            hit = row.get("retrieval_hit")
             model_refused = row.get("model_refused")
             should_refuse = row.get("should_refuse")
 
-            if hit is None or model_refused is None or should_refuse is None:
+            any_hit = _coalesce_bool(row, "any_hit", "retrieval_hit")
+            full_hit = _coalesce_bool(row, "full_hit")
+            partial_hit = _coalesce_bool(row, "partial_hit")
+
+            if model_refused is None or should_refuse is None or any_hit is None:
                 continue
 
-            hit = bool(hit)
             model_refused = bool(model_refused)
             should_refuse = bool(should_refuse)
+            any_hit = bool(any_hit)
+            full_hit = bool(full_hit) if full_hit is not None else False
+            partial_hit = bool(partial_hit) if partial_hit is not None else False
 
             n_rows += 1
 
-            if hit:
-                hit_total += 1
+            if any_hit:
+                any_hit_total += 1
                 if model_refused:
-                    hit_refuse += 1
+                    any_hit_refuse += 1
             else:
-                nohit_total += 1
+                no_hit_total += 1
                 if model_refused:
-                    nohit_refuse += 1
+                    no_hit_refuse += 1
 
-            category = classify_case(hit, should_refuse, model_refused)
+            if partial_hit:
+                partial_hit_total += 1
+                if model_refused:
+                    partial_hit_refuse += 1
+
+            if full_hit:
+                full_hit_total += 1
+                if model_refused:
+                    full_hit_refuse += 1
+
+            category = classify_case(
+                any_hit=any_hit,
+                full_hit=full_hit,
+                partial_hit=partial_hit,
+                should_refuse=should_refuse,
+                model_refused=model_refused,
+            )
             category_counts[category] += 1
 
     if n_rows == 0:
         return None
 
-    p_hit = hit_refuse / hit_total if hit_total else None
-    p_nohit = nohit_refuse / nohit_total if nohit_total else None
-    gap = (p_nohit - p_hit) if (p_hit is not None and p_nohit is not None) else None
+    p_any_hit = any_hit_refuse / any_hit_total if any_hit_total else None
+    p_no_hit = no_hit_refuse / no_hit_total if no_hit_total else None
+    p_partial_hit = partial_hit_refuse / partial_hit_total if partial_hit_total else None
+    p_full_hit = full_hit_refuse / full_hit_total if full_hit_total else None
+
+    gap_nohit_minus_any = (
+        p_no_hit - p_any_hit
+        if (p_any_hit is not None and p_no_hit is not None)
+        else None
+    )
+    gap_partial_minus_full = (
+        p_partial_hit - p_full_hit
+        if (p_partial_hit is not None and p_full_hit is not None)
+        else None
+    )
 
     summary = {
         "file": path.name,
@@ -114,17 +167,25 @@ def summarize_run(path: Path) -> dict[str, Any] | None:
         "top_k": top_k,
         "temperature": temperature,
         "hybrid_alpha": hybrid_alpha,
+        "prompt_version": prompt_version,
         "n_rows": n_rows,
-        "hit_n": hit_total,
-        "hit_refuse_n": hit_refuse,
-        "no_hit_n": nohit_total,
-        "no_hit_refuse_n": nohit_refuse,
-        "P(refusal|hit)": round(p_hit, 3) if p_hit is not None else None,
-        "P(refusal|no_hit)": round(p_nohit, 3) if p_nohit is not None else None,
-        "gap_nohit_minus_hit": round(gap, 3) if gap is not None else None,
+        "any_hit_n": any_hit_total,
+        "any_hit_refuse_n": any_hit_refuse,
+        "no_hit_n": no_hit_total,
+        "no_hit_refuse_n": no_hit_refuse,
+        "partial_hit_n": partial_hit_total,
+        "partial_hit_refuse_n": partial_hit_refuse,
+        "full_hit_n": full_hit_total,
+        "full_hit_refuse_n": full_hit_refuse,
+        "P(refusal|any_hit)": round(p_any_hit, 3) if p_any_hit is not None else None,
+        "P(refusal|no_hit)": round(p_no_hit, 3) if p_no_hit is not None else None,
+        "P(refusal|partial_hit)": round(p_partial_hit, 3) if p_partial_hit is not None else None,
+        "P(refusal|full_hit)": round(p_full_hit, 3) if p_full_hit is not None else None,
+        "gap_nohit_minus_anyhit": round(gap_nohit_minus_any, 3) if gap_nohit_minus_any is not None else None,
+        "gap_partial_minus_full": round(gap_partial_minus_full, 3) if gap_partial_minus_full is not None else None,
     }
 
-    for name in CATEGORY_NAMES:
+    for name in CONDITIONAL_REFUSAL_CATEGORY_NAMES:
         summary[name] = category_counts[name]
 
     return summary
@@ -138,25 +199,61 @@ def print_summary(rows: list[dict[str, Any]]) -> None:
         if row["retrieval_method"] == "hybrid" and row["hybrid_alpha"] is not None:
             extra = f" (alpha={row['hybrid_alpha']})"
 
-        p_hit_str = f"{row['P(refusal|hit)']:.3f}" if row["P(refusal|hit)"] is not None else "NA"
-        p_nohit_str = f"{row['P(refusal|no_hit)']:.3f}" if row["P(refusal|no_hit)"] is not None else "NA"
-        gap_str = f"{row['gap_nohit_minus_hit']:.3f}" if row["gap_nohit_minus_hit"] is not None else "NA"
+        p_any_str = (
+            f"{row['P(refusal|any_hit)']:.3f}"
+            if row["P(refusal|any_hit)"] is not None
+            else "NA"
+        )
+        p_nohit_str = (
+            f"{row['P(refusal|no_hit)']:.3f}"
+            if row["P(refusal|no_hit)"] is not None
+            else "NA"
+        )
+        p_partial_str = (
+            f"{row['P(refusal|partial_hit)']:.3f}"
+            if row["P(refusal|partial_hit)"] is not None
+            else "NA"
+        )
+        p_full_str = (
+            f"{row['P(refusal|full_hit)']:.3f}"
+            if row["P(refusal|full_hit)"] is not None
+            else "NA"
+        )
+        gap_nohit_any_str = (
+            f"{row['gap_nohit_minus_anyhit']:.3f}"
+            if row["gap_nohit_minus_anyhit"] is not None
+            else "NA"
+        )
+        gap_partial_full_str = (
+            f"{row['gap_partial_minus_full']:.3f}"
+            if row["gap_partial_minus_full"] is not None
+            else "NA"
+        )
 
         print(
             f"{str(row['model']):15} | "
             f"{str(row['retrieval_method']):7}{extra:12} | "
-            f"P(hit)={p_hit_str} | "
+            f"P(any_hit)={p_any_str} | "
             f"P(no_hit)={p_nohit_str} | "
-            f"gap={gap_str}"
+            f"P(partial)={p_partial_str} | "
+            f"P(full)={p_full_str}"
+        )
+        print(
+            f"  gaps: no_hit-any_hit={gap_nohit_any_str}, "
+            f"partial-full={gap_partial_full_str}"
         )
         print(
             "  taxonomy: "
             f"miss->correct_refusal={row['retrieval_miss_correct_refusal']}, "
-            f"over_refusal_with_evidence={row['over_refusal_with_evidence']}, "
+            f"over_refusal_with_partial_evidence={row['over_refusal_with_partial_evidence']}, "
+            f"over_refusal_with_full_evidence={row['over_refusal_with_full_evidence']}, "
             f"answer_without_evidence={row['answer_without_evidence']}, "
+            f"partial_support_answer={row['partial_support_answer']}, "
             f"correct_answer={row['correct_answer']}, "
-            f"correct_refusal_with_context={row['correct_refusal_with_context']}, "
-            f"under_refusal_with_context={row['under_refusal_with_context']}, "
+            f"correct_refusal_with_partial_context={row['correct_refusal_with_partial_context']}, "
+            f"correct_refusal_with_full_context={row['correct_refusal_with_full_context']}, "
+            f"under_refusal_with_partial_context={row['under_refusal_with_partial_context']}, "
+            f"under_refusal_with_full_context={row['under_refusal_with_full_context']}, "
             f"unsafe_answer_no_evidence={row['unsafe_answer_no_evidence']}, "
             f"other={row['other']}"
         )

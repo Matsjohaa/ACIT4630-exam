@@ -81,6 +81,14 @@ def _compute_metrics(tp: int, fp: int, tn: int, fn: int) -> dict[str, float]:
     }
 
 
+def _coalesce_bool(row: dict[str, Any], *keys: str) -> bool:
+    for key in keys:
+        value = row.get(key)
+        if isinstance(value, bool):
+            return value
+    return False
+
+
 def _build_refusal_type_columns(
     refusal_type_counts: dict[str, int],
     refusal_type_refused: dict[str, int],
@@ -93,7 +101,9 @@ def _build_refusal_type_columns(
 
         columns[f"refuse_n__{refusal_type}"] = total
         columns[f"refuse_refused__{refusal_type}"] = refused
-        columns[f"refuse_refused_rate__{refusal_type}"] = _safe_div(refused, total) if total else None
+        columns[f"refuse_refused_rate__{refusal_type}"] = (
+            _safe_div(refused, total) if total else None
+        )
 
     return columns
 
@@ -102,6 +112,7 @@ def _build_slice_columns(
     slice_counts: dict[str, int],
     slice_over_refusal: dict[str, int],
     slice_unsupported: dict[str, int],
+    slice_partial_support: dict[str, int],
     slice_ungrounded: dict[str, int],
     slice_strict_correct: dict[str, int],
     slice_strict_den: dict[str, int],
@@ -112,19 +123,26 @@ def _build_slice_columns(
         total = slice_counts.get(slice_name, 0)
 
         columns[f"slice_n__{slice_name}"] = total
-        columns[f"slice_over_refusal_rate__{slice_name}"] = _safe_div(
-            slice_over_refusal[slice_name], total
-        ) if total else None
-        columns[f"slice_unsupported_rate__{slice_name}"] = _safe_div(
-            slice_unsupported[slice_name], total
-        ) if total else None
-        columns[f"slice_ungrounded_rate__{slice_name}"] = _safe_div(
-            slice_ungrounded[slice_name], total
-        ) if total else None
-        columns[f"slice_strict_correct_rate__{slice_name}"] = _safe_div(
-            slice_strict_correct[slice_name],
-            slice_strict_den[slice_name],
-        ) if slice_strict_den[slice_name] else None
+        columns[f"slice_over_refusal_rate__{slice_name}"] = (
+            _safe_div(slice_over_refusal[slice_name], total) if total else None
+        )
+        columns[f"slice_unsupported_rate__{slice_name}"] = (
+            _safe_div(slice_unsupported[slice_name], total) if total else None
+        )
+        columns[f"slice_partial_support_rate__{slice_name}"] = (
+            _safe_div(slice_partial_support[slice_name], total) if total else None
+        )
+        columns[f"slice_ungrounded_rate__{slice_name}"] = (
+            _safe_div(slice_ungrounded[slice_name], total) if total else None
+        )
+        columns[f"slice_strict_correct_rate__{slice_name}"] = (
+            _safe_div(
+                slice_strict_correct[slice_name],
+                slice_strict_den[slice_name],
+            )
+            if slice_strict_den[slice_name]
+            else None
+        )
 
     return columns
 
@@ -145,9 +163,14 @@ def _summarize_file(path: Path) -> dict[str, object]:
     model = first.get("model")
     temperature = first.get("temperature")
     mode = first.get("mode")
+    prompt_version = first.get("prompt_version")
+    system_prompt_sha256 = first.get("system_prompt_sha256")
 
     tp = fp = tn = fn = 0
-    retrieval_hits = 0
+
+    any_hits = 0
+    full_hits = 0
+    partial_hits = 0
 
     n_total = len(rows)
     n_errors = 0
@@ -157,11 +180,13 @@ def _summarize_file(path: Path) -> dict[str, object]:
     n_answer_correct_strict = 0
     n_answer_correct_strict_den = 0
     n_unsupported_non_refusal = 0
+    n_partial_support_non_refusal = 0
     n_ungrounded_non_refusal = 0
 
     slice_counts = {name: 0 for name in DEFAULT_IN_SCOPE_SLICES}
     slice_over_refusal = {name: 0 for name in DEFAULT_IN_SCOPE_SLICES}
     slice_unsupported = {name: 0 for name in DEFAULT_IN_SCOPE_SLICES}
+    slice_partial_support = {name: 0 for name in DEFAULT_IN_SCOPE_SLICES}
     slice_ungrounded = {name: 0 for name in DEFAULT_IN_SCOPE_SLICES}
     slice_strict_correct = {name: 0 for name in DEFAULT_IN_SCOPE_SLICES}
     slice_strict_den = {name: 0 for name in DEFAULT_IN_SCOPE_SLICES}
@@ -174,6 +199,10 @@ def _summarize_file(path: Path) -> dict[str, object]:
             n_errors += 1
             if row.get("unsupported_non_refusal"):
                 n_unsupported_non_refusal += 1
+            if row.get("partial_support_non_refusal"):
+                n_partial_support_non_refusal += 1
+            if row.get("ungrounded_non_refusal"):
+                n_ungrounded_non_refusal += 1
             continue
 
         should_refuse = bool(row.get("should_refuse"))
@@ -189,11 +218,22 @@ def _summarize_file(path: Path) -> dict[str, object]:
         else:
             fn += 1
 
-        if row.get("retrieval_hit"):
-            retrieval_hits += 1
+        any_hit = _coalesce_bool(row, "any_hit", "retrieval_hit")
+        full_hit = _coalesce_bool(row, "full_hit")
+        partial_hit = _coalesce_bool(row, "partial_hit")
+
+        if any_hit:
+            any_hits += 1
+        if full_hit:
+            full_hits += 1
+        if partial_hit:
+            partial_hits += 1
 
         if row.get("unsupported_non_refusal"):
             n_unsupported_non_refusal += 1
+
+        if row.get("partial_support_non_refusal"):
+            n_partial_support_non_refusal += 1
 
         if row.get("ungrounded_non_refusal"):
             n_ungrounded_non_refusal += 1
@@ -214,6 +254,8 @@ def _summarize_file(path: Path) -> dict[str, object]:
                 slice_over_refusal[question_type] += 1
             if row.get("unsupported_non_refusal"):
                 slice_unsupported[question_type] += 1
+            if row.get("partial_support_non_refusal"):
+                slice_partial_support[question_type] += 1
             if row.get("ungrounded_non_refusal"):
                 slice_ungrounded[question_type] += 1
             if isinstance(row.get("answer_correct_strict"), bool):
@@ -235,7 +277,11 @@ def _summarize_file(path: Path) -> dict[str, object]:
     metrics = _compute_metrics(tp, fp, tn, fn)
 
     n_ok = n_total - n_errors
-    answer_correct_rate = _safe_div(n_answer_correct, n_answer_correct_den) if n_answer_correct_den else None
+    answer_correct_rate = (
+        _safe_div(n_answer_correct, n_answer_correct_den)
+        if n_answer_correct_den
+        else None
+    )
     answer_correct_strict_rate = (
         _safe_div(n_answer_correct_strict, n_answer_correct_strict_den)
         if n_answer_correct_strict_den
@@ -250,6 +296,7 @@ def _summarize_file(path: Path) -> dict[str, object]:
         slice_counts,
         slice_over_refusal,
         slice_unsupported,
+        slice_partial_support,
         slice_ungrounded,
         slice_strict_correct,
         slice_strict_den,
@@ -262,10 +309,14 @@ def _summarize_file(path: Path) -> dict[str, object]:
                 key: {
                     "n": refusal_type_counts.get(key, 0),
                     "refused": refusal_type_refused.get(key, 0),
-                    "refused_rate": _safe_div(
-                        refusal_type_refused.get(key, 0),
-                        refusal_type_counts.get(key, 0),
-                    ) if refusal_type_counts.get(key) else 0.0,
+                    "refused_rate": (
+                        _safe_div(
+                            refusal_type_refused.get(key, 0),
+                            refusal_type_counts.get(key, 0),
+                        )
+                        if refusal_type_counts.get(key)
+                        else 0.0
+                    ),
                 }
                 for key in sorted(refusal_type_counts)
             },
@@ -282,9 +333,14 @@ def _summarize_file(path: Path) -> dict[str, object]:
         "fp": fp,
         "tn": tn,
         "fn": fn,
-        "retrieval_hit_rate": _safe_div(retrieval_hits, n_ok),
+        "any_hit_rate": _safe_div(any_hits, n_ok),
+        "full_hit_rate": _safe_div(full_hits, n_ok),
+        "partial_hit_rate": _safe_div(partial_hits, n_ok),
+        "retrieval_hit_rate": _safe_div(any_hits, n_ok),
         "unsupported_non_refusal": n_unsupported_non_refusal,
         "unsupported_non_refusal_rate": _safe_div(n_unsupported_non_refusal, n_total),
+        "partial_support_non_refusal": n_partial_support_non_refusal,
+        "partial_support_non_refusal_rate": _safe_div(n_partial_support_non_refusal, n_total),
         "ungrounded_non_refusal": n_ungrounded_non_refusal,
         "ungrounded_non_refusal_rate": _safe_div(n_ungrounded_non_refusal, n_total),
         "answer_correct_rate": answer_correct_rate,
@@ -295,6 +351,8 @@ def _summarize_file(path: Path) -> dict[str, object]:
         "top_k": top_k,
         "retrieval_method": retrieval_method,
         "hybrid_alpha": hybrid_alpha,
+        "prompt_version": prompt_version,
+        "system_prompt_sha256": system_prompt_sha256,
         **metrics,
         **refusal_type_columns,
         **slice_columns,
@@ -350,7 +408,9 @@ def main() -> int:
             f"n={row.get('n')}\t"
             f"acc={float(row.get('accuracy', 0.0)):.3f}\t"
             f"f1={float(row.get('f1', 0.0)):.3f}\t"
-            f"mcc={float(row.get('mcc', 0.0)):.3f}"
+            f"mcc={float(row.get('mcc', 0.0)):.3f}\t"
+            f"any_hit={float(row.get('any_hit_rate', 0.0)):.3f}\t"
+            f"full_hit={float(row.get('full_hit_rate', 0.0)):.3f}"
         )
 
     return 0

@@ -28,6 +28,7 @@ from tek17.rag.config import (
     LLM_PROVIDER,
     LLM_TEMPERATURE,
     PROMPT_VERSION,
+    PROMPT_VERSIONS,
     REFUSAL_PATTERNS,
     REFUSAL_TAG,
     REQUEST_TIMEOUT_S,
@@ -45,7 +46,6 @@ from tek17.rag.retrieval.client import get_collection, retrieve, vectorstore_sna
 
 Mode = Literal["local", "server"]
 Provider = Literal["ollama", "openai"]
-VALID_PROMPT_VERSIONS = {"baseline", "relaxed", "strict"}
 
 
 @dataclass(frozen=True)
@@ -66,6 +66,16 @@ class RunConfig:
     embed_model: str
     llm_base_url: str | None
     prompt_version: str
+
+
+@dataclass(frozen=True)
+class RetrievalCoverage:
+    any_hit: bool
+    full_hit: bool
+    partial_hit: bool
+    retrieved_sections: list[str]
+    normalized_retrieved_sections: list[str]
+    normalized_target_sections: list[str]
 
 
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -194,21 +204,48 @@ def _normalize_section_id(value: str) -> str:
     return normalized
 
 
-def _retrieval_hit(sources: list[dict[str, Any]], target_sections: list[str]) -> bool:
-    if not target_sections:
-        return False
+def _normalize_section_set(sections: Iterable[str]) -> set[str]:
+    return {
+        _normalize_section_id(section)
+        for section in sections
+        if str(section).strip()
+    }
 
-    retrieved = {
-        _normalize_section_id((source or {}).get("section_id", ""))
+
+def _retrieval_coverage(
+    sources: list[dict[str, Any]],
+    target_sections: list[str],
+) -> RetrievalCoverage:
+    retrieved_sections = [
+        str((source or {}).get("section_id", "")).strip()
         for source in sources
         if str((source or {}).get("section_id", "")).strip()
-    }
-    targets = {
-        _normalize_section_id(target)
-        for target in target_sections
-        if str(target).strip()
-    }
-    return not retrieved.isdisjoint(targets)
+    ]
+    normalized_retrieved = _normalize_section_set(retrieved_sections)
+    normalized_targets = _normalize_section_set(target_sections)
+
+    if not normalized_targets:
+        return RetrievalCoverage(
+            any_hit=False,
+            full_hit=False,
+            partial_hit=False,
+            retrieved_sections=retrieved_sections,
+            normalized_retrieved_sections=sorted(normalized_retrieved),
+            normalized_target_sections=sorted(normalized_targets),
+        )
+
+    any_hit = not normalized_retrieved.isdisjoint(normalized_targets)
+    full_hit = normalized_targets.issubset(normalized_retrieved)
+    partial_hit = any_hit and not full_hit
+
+    return RetrievalCoverage(
+        any_hit=any_hit,
+        full_hit=full_hit,
+        partial_hit=partial_hit,
+        retrieved_sections=retrieved_sections,
+        normalized_retrieved_sections=sorted(normalized_retrieved),
+        normalized_target_sections=sorted(normalized_targets),
+    )
 
 
 def _query_server(question: str, cfg: RunConfig) -> dict[str, Any]:
@@ -371,12 +408,16 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
     correct_answer = 0
     correct_answer_strict = 0
     unsupported_non_refusal = 0
+    partial_support_non_refusal = 0
     ungrounded_non_refusal = 0
     query_failed = 0
 
     tp_refuse = fp_refuse = tn_refuse = fn_refuse = 0
-    tp_hit = fp_hit = tn_hit = fn_hit = 0
-    tp_miss = fp_miss = tn_miss = fn_miss = 0
+
+    tp_any = fp_any = tn_any = fn_any = 0
+    tp_full = fp_full = tn_full = fn_full = 0
+    tp_none = fp_none = tn_none = fn_none = 0
+    tp_partial = fp_partial = tn_partial = fn_partial = 0
 
     refusal_type_counts: dict[str, int] = {}
     refusal_type_refused: dict[str, int] = {}
@@ -414,7 +455,7 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
     else:
         print(f"chroma_dir: {cfg.chroma_dir}")
         print(f"collection: {cfg.collection}")
-    print("id\tshould_refuse\tmodel_refused\tretrieval_hit\tstatus")
+    print("id\tshould_refuse\tmodel_refused\tany_hit\tfull_hit\tpartial_hit\tstatus")
 
     for item in items:
         question_id = str(item.get("id", ""))
@@ -437,7 +478,7 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
             data = _run_query(question, cfg)
         except Exception as exc:
             query_failed += 1
-            print(f"{question_id}\t{should_refuse}\tERROR\t0\tquery_failed: {exc}")
+            print(f"{question_id}\t{should_refuse}\tERROR\t0\t0\t0\tquery_failed: {exc}")
 
             if out is not None:
                 rows_out.append(
@@ -454,14 +495,20 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
                         "refused_heuristic": None,
                         "status": "query_failed",
                         "retrieval_hit": None,
+                        "any_hit": None,
+                        "full_hit": None,
+                        "partial_hit": None,
                         "answer_correct": False,
                         "answer_correct_strict": False,
                         "answer_supported": None,
                         "unsupported_non_refusal": False,
+                        "partial_support_non_refusal": False,
                         "ungrounded_non_refusal": False,
                         "groundedness_score": None,
                         "answer_grounded": None,
                         "target_sections": target_sections,
+                        "normalized_target_sections": None,
+                        "normalized_retrieved_sections": None,
                         "answer": None,
                         "sources": None,
                         "llm_finish_reason": None,
@@ -482,20 +529,15 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
 
         answer = data.get("answer", "")
         sources = data.get("sources", []) or []
-        retrieval_hit = _retrieval_hit(
+
+        coverage = _retrieval_coverage(
             sources,
             list(target_sections) if isinstance(target_sections, list) else [],
         )
-        retrieved_section_ids = [
-            str((source or {}).get("section_id", "")).strip()
-            for source in sources
-        ]
-
-        # print(
-        #     f"DEBUG {question_id}: "
-        #     f"targets={target_sections} "
-        #     f"retrieved={retrieved_section_ids}"
-        # )
+        any_hit = coverage.any_hit
+        full_hit = coverage.full_hit
+        partial_hit = coverage.partial_hit
+        retrieval_hit = any_hit
 
         refused_tagged = _has_refusal_tag(answer)
         refused_heuristic = _classify_refusal(answer)
@@ -514,25 +556,27 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
                 answer_supported = None
                 answer_correct_strict = False
             else:
-                answer_supported = bool(retrieval_hit)
-                answer_correct = bool(retrieval_hit)
-                answer_correct_strict = bool(retrieval_hit) and bool(grounded)
+                answer_supported = bool(full_hit)
+                answer_correct = bool(full_hit)
+                answer_correct_strict = bool(full_hit) and bool(grounded)
 
         status = ""
-        if (not should_refuse) and (not model_refused) and retrieval_hit and (not grounded):
-            ungrounded_non_refusal += 1
-            status = "ungrounded_answer"
-
-        if (not should_refuse) and (not model_refused) and (not retrieval_hit):
+        if (not should_refuse) and (not model_refused) and (not any_hit):
             unsupported_non_refusal += 1
             status = "unsupported_answer"
+        elif (not should_refuse) and (not model_refused) and partial_hit:
+            partial_support_non_refusal += 1
+            status = "partial_support_answer"
+        elif (not should_refuse) and (not model_refused) and full_hit and (not grounded):
+            ungrounded_non_refusal += 1
+            status = "ungrounded_answer"
 
         if should_refuse and model_refused:
             tp_refuse += 1
             status = "correct_refusal"
         elif (not should_refuse) and (not model_refused):
             tn_refuse += 1
-            if status != "unsupported_answer":
+            if not status:
                 status = "correct_answer"
         elif (not should_refuse) and model_refused:
             fp_refuse += 1
@@ -547,24 +591,44 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
             if model_refused:
                 refusal_type_refused[key] = refusal_type_refused.get(key, 0) + 1
 
-        if retrieval_hit:
+        if any_hit:
             if should_refuse and model_refused:
-                tp_hit += 1
+                tp_any += 1
             elif (not should_refuse) and (not model_refused):
-                tn_hit += 1
+                tn_any += 1
             elif (not should_refuse) and model_refused:
-                fp_hit += 1
+                fp_any += 1
             else:
-                fn_hit += 1
+                fn_any += 1
         else:
             if should_refuse and model_refused:
-                tp_miss += 1
+                tp_none += 1
             elif (not should_refuse) and (not model_refused):
-                tn_miss += 1
+                tn_none += 1
             elif (not should_refuse) and model_refused:
-                fp_miss += 1
+                fp_none += 1
             else:
-                fn_miss += 1
+                fn_none += 1
+
+        if full_hit:
+            if should_refuse and model_refused:
+                tp_full += 1
+            elif (not should_refuse) and (not model_refused):
+                tn_full += 1
+            elif (not should_refuse) and model_refused:
+                fp_full += 1
+            else:
+                fn_full += 1
+
+        if partial_hit:
+            if should_refuse and model_refused:
+                tp_partial += 1
+            elif (not should_refuse) and (not model_refused):
+                tn_partial += 1
+            elif (not should_refuse) and model_refused:
+                fp_partial += 1
+            else:
+                fn_partial += 1
 
         if (should_refuse and model_refused) or ((not should_refuse) and (not model_refused)):
             correct += 1
@@ -573,7 +637,10 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
         if answer_correct_strict:
             correct_answer_strict += 1
 
-        print(f"{question_id}\t{should_refuse}\t{model_refused}\t{int(retrieval_hit)}\t{status}")
+        print(
+            f"{question_id}\t{should_refuse}\t{model_refused}\t"
+            f"{int(any_hit)}\t{int(full_hit)}\t{int(partial_hit)}\t{status}"
+        )
 
         if out is not None:
             rows_out.append(
@@ -590,14 +657,21 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
                     "refused_heuristic": refused_heuristic,
                     "status": status,
                     "retrieval_hit": retrieval_hit,
+                    "any_hit": any_hit,
+                    "full_hit": full_hit,
+                    "partial_hit": partial_hit,
                     "answer_correct": answer_correct,
                     "answer_correct_strict": answer_correct_strict,
                     "answer_supported": answer_supported,
-                    "unsupported_non_refusal": (not should_refuse) and (not model_refused) and (not retrieval_hit),
-                    "ungrounded_non_refusal": (not should_refuse) and (not model_refused) and retrieval_hit and (not grounded),
+                    "unsupported_non_refusal": (not should_refuse) and (not model_refused) and (not any_hit),
+                    "partial_support_non_refusal": (not should_refuse) and (not model_refused) and partial_hit,
+                    "ungrounded_non_refusal": (not should_refuse) and (not model_refused) and full_hit and (not grounded),
                     "groundedness_score": groundedness,
                     "answer_grounded": grounded if (not should_refuse) and (not model_refused) else None,
                     "target_sections": target_sections,
+                    "normalized_target_sections": coverage.normalized_target_sections,
+                    "retrieved_section_ids": coverage.retrieved_sections,
+                    "normalized_retrieved_sections": coverage.normalized_retrieved_sections,
                     "answer": answer,
                     "sources": sources,
                     "llm_finish_reason": data.get("llm_finish_reason"),
@@ -642,37 +716,64 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
         corr_lo, corr_hi = _wilson_ci(correct_answer, total)
 
         print()
-        print("Lightweight answer correctness (support-based):")
+        print("Lightweight answer correctness (full-hit support-based):")
         print(f"  accuracy                   : {correctness_acc:.3f} (95% CI {corr_lo:.3f}–{corr_hi:.3f})")
         print(f"  unsupported_non_refusals   : {unsupported_non_refusal} ({(unsupported_non_refusal / total):.3f} of all items)")
+        print(f"  partial_support_answers    : {partial_support_non_refusal} ({(partial_support_non_refusal / total):.3f} of all items)")
         print(f"  ungrounded_non_refusals    : {ungrounded_non_refusal} ({(ungrounded_non_refusal / total):.3f} of all items)")
         print(f"  query_failed               : {query_failed} ({(query_failed / total):.3f} of all items)")
 
         strict_acc = correct_answer_strict / total
         strict_lo, strict_hi = _wilson_ci(correct_answer_strict, total)
 
-        print("Strict answer correctness (retrieval_hit + groundedness):")
+        print("Strict answer correctness (full_hit + groundedness):")
         print(f"  accuracy                   : {strict_acc:.3f} (95% CI {strict_lo:.3f}–{strict_hi:.3f})")
 
-        n_hit = tp_hit + fp_hit + tn_hit + fn_hit
-        n_miss = tp_miss + fp_miss + tn_miss + fn_miss
-        if n_hit and n_miss:
-            metrics_hit = _compute_refusal_metrics(tp_hit, fp_hit, tn_hit, fn_hit)
-            metrics_miss = _compute_refusal_metrics(tp_miss, fp_miss, tn_miss, fn_miss)
+        n_any = tp_any + fp_any + tn_any + fn_any
+        n_none = tp_none + fp_none + tn_none + fn_none
+        n_full = tp_full + fp_full + tn_full + fn_full
+        n_partial = tp_partial + fp_partial + tn_partial + fn_partial
 
+        if n_any:
+            metrics_any = _compute_refusal_metrics(tp_any, fp_any, tn_any, fn_any)
             print()
-            print("Breakdown by retrieval_hit:")
+            print("Breakdown by any_hit:")
             print(
-                f"  retrieval_hit=1 (n={n_hit}) "
-                f"acc={metrics_hit['accuracy']:.3f} "
-                f"f1={metrics_hit['f1']:.3f} "
-                f"mcc={metrics_hit['mcc']:.3f}"
+                f"  any_hit=1 (n={n_any}) "
+                f"acc={metrics_any['accuracy']:.3f} "
+                f"f1={metrics_any['f1']:.3f} "
+                f"mcc={metrics_any['mcc']:.3f}"
             )
+
+        if n_none:
+            metrics_none = _compute_refusal_metrics(tp_none, fp_none, tn_none, fn_none)
             print(
-                f"  retrieval_hit=0 (n={n_miss}) "
-                f"acc={metrics_miss['accuracy']:.3f} "
-                f"f1={metrics_miss['f1']:.3f} "
-                f"mcc={metrics_miss['mcc']:.3f}"
+                f"  any_hit=0 (n={n_none}) "
+                f"acc={metrics_none['accuracy']:.3f} "
+                f"f1={metrics_none['f1']:.3f} "
+                f"mcc={metrics_none['mcc']:.3f}"
+            )
+
+        if n_full:
+            metrics_full = _compute_refusal_metrics(tp_full, fp_full, tn_full, fn_full)
+            print()
+            print("Breakdown by full_hit:")
+            print(
+                f"  full_hit=1 (n={n_full}) "
+                f"acc={metrics_full['accuracy']:.3f} "
+                f"f1={metrics_full['f1']:.3f} "
+                f"mcc={metrics_full['mcc']:.3f}"
+            )
+
+        if n_partial:
+            metrics_partial = _compute_refusal_metrics(tp_partial, fp_partial, tn_partial, fn_partial)
+            print()
+            print("Breakdown by partial_hit:")
+            print(
+                f"  partial_hit=1 (n={n_partial}) "
+                f"acc={metrics_partial['accuracy']:.3f} "
+                f"f1={metrics_partial['f1']:.3f} "
+                f"mcc={metrics_partial['mcc']:.3f}"
             )
 
         if refusal_type_counts:
@@ -738,7 +839,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--prompt-version",
         type=str,
         default=PROMPT_VERSION,
-        help="Prompt variant to use: baseline, relaxed, or strict",
+        help="Prompt variant to use",
     )
 
     return parser
@@ -748,10 +849,10 @@ def main() -> int:
     args = _build_parser().parse_args()
 
     prompt_version = _normalize_prompt_version(args.prompt_version)
-    if prompt_version not in VALID_PROMPT_VERSIONS:
+    if prompt_version not in PROMPT_VERSIONS:
         print(
             "ERROR: invalid --prompt-version. "
-            f"Expected one of: {', '.join(sorted(VALID_PROMPT_VERSIONS))}"
+            f"Expected one of: {', '.join(sorted(PROMPT_VERSIONS))}"
         )
         return 2
 

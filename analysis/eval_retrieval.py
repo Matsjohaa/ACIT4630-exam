@@ -42,25 +42,38 @@ def _normalize_section_id(value: str) -> str:
     return normalized
 
 
-def _contains_target(
+def _normalize_section_set(sections: Iterable[str]) -> set[str]:
+    return {
+        _normalize_section_id(section)
+        for section in sections
+        if str(section).strip()
+    }
+
+
+def _any_target_hit(
     retrieved_sections: Iterable[str],
     target_sections: Iterable[str],
 ) -> bool:
-    retrieved_set = {
-        _normalize_section_id(section)
-        for section in retrieved_sections
-        if str(section).strip()
-    }
-    target_set = {
-        _normalize_section_id(section)
-        for section in target_sections
-        if str(section).strip()
-    }
+    retrieved_set = _normalize_section_set(retrieved_sections)
+    target_set = _normalize_section_set(target_sections)
 
     if not target_set:
         return False
 
     return not retrieved_set.isdisjoint(target_set)
+
+
+def _full_target_hit(
+    retrieved_sections: Iterable[str],
+    target_sections: Iterable[str],
+) -> bool:
+    retrieved_set = _normalize_section_set(retrieved_sections)
+    target_set = _normalize_section_set(target_sections)
+
+    if not target_set:
+        return False
+
+    return target_set.issubset(retrieved_set)
 
 
 def _normalize_retrieval_method(method: str) -> str:
@@ -89,7 +102,8 @@ def evaluate_retrieval(
     collection = get_collection(chroma_dir, collection_name)
 
     total_with_targets = 0
-    hits = 0
+    any_hits = 0
+    full_hits = 0
     normalized_method = _normalize_retrieval_method(retrieval_method)
 
     out_file = None
@@ -100,7 +114,7 @@ def evaluate_retrieval(
     try:
         print(f"Using collection '{collection_name}' in {chroma_dir}")
         print(f"Top-k = {top_k}, eval items = {len(items)}")
-        print("id\twith_targets\thit\ttarget_sections\tretrieved_section_ids")
+        print("id\twith_targets\tany_hit\tfull_hit\ttarget_sections\tretrieved_section_ids")
 
         for item in items:
             question_id = item.get("id", "")
@@ -138,12 +152,16 @@ def evaluate_retrieval(
                 for metadata in metadatas
             ]
 
-            hit = _contains_target(retrieved_sections, target_sections) if has_targets else False
-            if hit:
-                hits += 1
+            any_hit = _any_target_hit(retrieved_sections, target_sections) if has_targets else False
+            full_hit = _full_target_hit(retrieved_sections, target_sections) if has_targets else False
+
+            if any_hit:
+                any_hits += 1
+            if full_hit:
+                full_hits += 1
 
             print(
-                f"{question_id}\t{int(has_targets)}\t{int(hit)}\t"
+                f"{question_id}\t{int(has_targets)}\t{int(any_hit)}\t{int(full_hit)}\t"
                 f"{target_sections}\t{retrieved_sections}"
             )
 
@@ -154,7 +172,8 @@ def evaluate_retrieval(
                     "target_sections": target_sections,
                     "retrieved_sections": retrieved_sections,
                     "has_targets": has_targets,
-                    "hit": bool(hit),
+                    "any_hit": bool(any_hit),
+                    "full_hit": bool(full_hit),
                     "top_k": top_k,
                     "retrieval_method": normalized_method,
                     "hybrid_alpha": hybrid_alpha,
@@ -169,12 +188,15 @@ def evaluate_retrieval(
             print("No items with non-empty target_sections; nothing to score.")
             return
 
-        recall_at_k = hits / total_with_targets
+        any_recall_at_k = any_hits / total_with_targets
+        full_recall_at_k = full_hits / total_with_targets
 
         print()
         print(f"Questions with target_sections: {total_with_targets}")
-        print(f"Hits (at least one target retrieved): {hits}")
-        print(f"Recall@{top_k}: {recall_at_k:.3f}")
+        print(f"Any hits (at least one target retrieved): {any_hits}")
+        print(f"Full hits (all target sections retrieved): {full_hits}")
+        print(f"Any-hit Recall@{top_k}: {any_recall_at_k:.3f}")
+        print(f"Full-hit Recall@{top_k}: {full_recall_at_k:.3f}")
 
     finally:
         if out_file is not None:

@@ -74,6 +74,7 @@ OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")
 # ---------------------------------------------------------------------------
 
 PROMPT_VERSION = os.getenv("TEK17_PROMPT_VERSION", "baseline").strip().lower()
+PROMPT_VERSIONS = {"baseline", "relaxed", "strict"}
 LLM_BASE_URL = os.getenv("TEK17_LLM_BASE_URL", OLLAMA_BASE_URL)
 LLM_PROVIDER = os.getenv("TEK17_LLM_PROVIDER", "ollama").strip().lower()
 LLM_MODEL = os.getenv("TEK17_LLM_MODEL", "llama3.2").strip()
@@ -198,3 +199,18 @@ BENCHMARK_COMPARE_SHOW = _get_int_env("TEK17_BENCHMARK_COMPARE_SHOW", 50)
 # ---------------------------------------------------------------------------
 
 SWEEP_REPEAT = _get_int_env("TEK17_SWEEP_REPEAT", 1)
+
+CONDITIONAL_REFUSAL_CATEGORY_NAMES = [
+    "retrieval_miss_correct_refusal",
+    "over_refusal_with_partial_evidence",
+    "over_refusal_with_full_evidence",
+    "answer_without_evidence",
+    "partial_support_answer",
+    "correct_answer",
+    "correct_refusal_with_partial_context",
+    "correct_refusal_with_full_context",
+    "under_refusal_with_partial_context",
+    "under_refusal_with_full_context",
+    "unsafe_answer_no_evidence",
+    "other",
+]

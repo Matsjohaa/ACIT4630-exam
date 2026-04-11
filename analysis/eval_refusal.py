@@ -10,11 +10,17 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import requests
 
-from tek17.rag.config import SERVER_URL, TOP_K
+from tek17.rag.config import (
+    REQUEST_TIMEOUT_S,
+    REFUSAL_PATTERNS,
+    REFUSAL_TAG,
+    SERVER_URL,
+    TOP_K,
+)
 
 
 def _load_eval_items(path: Path) -> list[dict[str, Any]]:
@@ -30,24 +36,56 @@ def _load_eval_items(path: Path) -> list[dict[str, Any]]:
     return items
 
 
+def _normalize_section_id(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    normalized = normalized.replace("§", "")
+    normalized = " ".join(normalized.split())
+    return normalized
+
+
+def _normalize_section_set(sections: Iterable[str]) -> set[str]:
+    return {
+        _normalize_section_id(section)
+        for section in sections
+        if str(section).strip()
+    }
+
+
+def _retrieval_coverage(
+    retrieved_sections: Iterable[str],
+    target_sections: Iterable[str],
+) -> dict[str, bool]:
+    retrieved_set = _normalize_section_set(retrieved_sections)
+    target_set = _normalize_section_set(target_sections)
+
+    if not target_set:
+        return {
+            "any_hit": False,
+            "full_hit": False,
+            "partial_hit": False,
+        }
+
+    any_hit = not retrieved_set.isdisjoint(target_set)
+    full_hit = target_set.issubset(retrieved_set)
+    partial_hit = any_hit and not full_hit
+
+    return {
+        "any_hit": any_hit,
+        "full_hit": full_hit,
+        "partial_hit": partial_hit,
+    }
+
+
 def _classify_refusal(answer: str) -> bool:
     """Return True if the answer appears to be a refusal."""
-    text = answer.lower()
-
-    if "kan_ikke_svare" in text:
+    text = (answer or "").strip().lower()
+    if not text:
         return True
 
-    refusal_patterns = [
-        "kan ikke svare",
-        "kan ikke gi et sikkert svar",
-        "har ikke nok informasjon",
-        "finner ikke nok informasjon",
-        "kan ikke gi råd",
-        "kan ikke gi et konkret svar",
-        "utenfor det som dekkes av tek17",
-    ]
+    if REFUSAL_TAG.lower() in text:
+        return True
 
-    return any(pattern in text for pattern in refusal_patterns)
+    return any(pattern in text for pattern in REFUSAL_PATTERNS)
 
 
 def evaluate_refusal(
@@ -78,7 +116,7 @@ def evaluate_refusal(
 
     try:
         print(f"Using RAG server at {server_url}")
-        print("id\tshould_refuse\tmodel_refused\tretrieval_hit\tstatus")
+        print("id\tshould_refuse\tmodel_refused\tany_hit\tfull_hit\tpartial_hit\tstatus")
 
         for item in items:
             question_id = item.get("id", "")
@@ -95,11 +133,11 @@ def evaluate_refusal(
                 response = requests.post(
                     f"{server_url}/query",
                     json={"question": question, "top_k": top_k},
-                    timeout=60,
+                    timeout=REQUEST_TIMEOUT_S,
                 )
                 response.raise_for_status()
             except Exception as exc:
-                print(f"{question_id}\t{should_refuse}\tERROR\t0\trequest_failed: {exc}")
+                print(f"{question_id}\t{should_refuse}\tERROR\t0\t0\t0\trequest_failed: {exc}")
 
                 if out_file is not None:
                     row = {
@@ -108,7 +146,10 @@ def evaluate_refusal(
                         "target_sections": target_sections,
                         "should_refuse": should_refuse,
                         "model_refused": None,
-                        "retrieval_hit": False,
+                        "retrieval_hit": None,
+                        "any_hit": None,
+                        "full_hit": None,
+                        "partial_hit": None,
                         "status": "request_failed",
                         "error": str(exc),
                         "answer": None,
@@ -124,15 +165,15 @@ def evaluate_refusal(
             sources = data.get("sources", []) or []
 
             retrieved_section_ids = [
-                (source or {}).get("section_id", "")
+                str((source or {}).get("section_id", "")).strip()
                 for source in sources
+                if str((source or {}).get("section_id", "")).strip()
             ]
 
-            retrieval_hit = False
-            if target_sections:
-                retrieved_set = {section.strip() for section in retrieved_section_ids if section}
-                target_set = {section.strip() for section in target_sections if section}
-                retrieval_hit = not retrieved_set.isdisjoint(target_set)
+            coverage = _retrieval_coverage(retrieved_section_ids, target_sections)
+            any_hit = coverage["any_hit"]
+            full_hit = coverage["full_hit"]
+            partial_hit = coverage["partial_hit"]
 
             model_refused = _classify_refusal(answer)
 
@@ -153,7 +194,8 @@ def evaluate_refusal(
                 correct += 1
 
             print(
-                f"{question_id}\t{should_refuse}\t{model_refused}\t{int(retrieval_hit)}\t{status}"
+                f"{question_id}\t{should_refuse}\t{model_refused}\t"
+                f"{int(any_hit)}\t{int(full_hit)}\t{int(partial_hit)}\t{status}"
             )
 
             if out_file is not None:
@@ -163,7 +205,10 @@ def evaluate_refusal(
                     "target_sections": target_sections,
                     "should_refuse": should_refuse,
                     "model_refused": model_refused,
-                    "retrieval_hit": retrieval_hit,
+                    "retrieval_hit": any_hit,
+                    "any_hit": any_hit,
+                    "full_hit": full_hit,
+                    "partial_hit": partial_hit,
                     "status": status,
                     "answer": answer,
                     "retrieved_section_ids": retrieved_section_ids,

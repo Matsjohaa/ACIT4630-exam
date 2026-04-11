@@ -32,6 +32,10 @@ Install and prepare Ollama (macOS example):
 ```bash
 brew install ollama
 brew services start ollama
+```
+This project requires two separate Ollama models:
+
+```bash
 ollama pull nomic-embed-text   # embedding model
 ollama pull llama3.2           # LLM
 ```
@@ -67,17 +71,20 @@ If you use Azure OpenAI or another compatible endpoint, also set `OPENAI_BASE_UR
 From a clean checkout with the virtualenv activated:
 
 ```bash
-# 1) Download TEK17 root-print snapshot from DiBK
-python -m tek17 download-dibk
+# 1. Download TEK17
+python3 -m tek17 download-dibk
 
-# 2) Parse HTML into one JSONL record per §
-python -m tek17 parse-dibk
+# 2. Parse
+python3 -m tek17 parse-dibk
 
-# 3) Chunk, embed and ingest into ChromaDB
-python -m tek17 ingest
+# 3. Chunk
+python3 -m tek17 chunk
 
-# 4) Start the RAG API server (terminal 1)
-python -m tek17 serve
+# 4. Ingest into ChromaDB
+python3 -m tek17 ingest
+
+# 5. Start RAG server (optional)
+python3 -m tek17 serve
 
 # 5) Start the Streamlit chat UI (terminal 2)
 python -m tek17 ui

@@ -18,7 +18,9 @@ class Metrics:
     specificity: float
     f1: float
     refusal_rate_pred: float
-    retrieval_hit_rate: float
+    any_hit_rate: float
+    full_hit_rate: float
+    partial_hit_rate: float
     query_failed_rate: float
 
 
@@ -43,6 +45,14 @@ def _load_jsonl_by_id(path: Path) -> dict[str, dict[str, Any]]:
             rows[row_id] = row
 
     return rows
+
+
+def _coalesce_bool(row: dict[str, Any], *keys: str) -> bool:
+    for key in keys:
+        value = row.get(key)
+        if isinstance(value, bool):
+            return value
+    return False
 
 
 def _confusion(rows: dict[str, dict[str, Any]]) -> tuple[int, int, int, int]:
@@ -72,7 +82,11 @@ def _metrics(rows: dict[str, dict[str, Any]]) -> Metrics:
 
     valid_rows = [row for row in rows.values() if row.get("status") != "query_failed"]
     total = tp + fp + tn + fn
-    retrieval_hits = sum(1 for row in valid_rows if bool(row.get("retrieval_hit", False)))
+    any_hits = sum(
+        1 for row in valid_rows if _coalesce_bool(row, "any_hit", "retrieval_hit")
+    )
+    full_hits = sum(1 for row in valid_rows if _coalesce_bool(row, "full_hit"))
+    partial_hits = sum(1 for row in valid_rows if _coalesce_bool(row, "partial_hit"))
     query_failed = sum(1 for row in rows.values() if row.get("status") == "query_failed")
 
     precision = _safe_div(tp, tp + fp)
@@ -88,7 +102,9 @@ def _metrics(rows: dict[str, dict[str, Any]]) -> Metrics:
         specificity=specificity,
         f1=f1,
         refusal_rate_pred=_safe_div(tp + fp, total),
-        retrieval_hit_rate=_safe_div(retrieval_hits, total),
+        any_hit_rate=_safe_div(any_hits, total),
+        full_hit_rate=_safe_div(full_hits, total),
+        partial_hit_rate=_safe_div(partial_hits, total),
         query_failed_rate=_safe_div(query_failed, len(rows)),
     )
 
@@ -102,7 +118,9 @@ def _format_metrics(metrics: Metrics) -> str:
         f"spec={metrics.specificity:.3f} "
         f"f1={metrics.f1:.3f} "
         f"refuse_pred={metrics.refusal_rate_pred:.3f} "
-        f"hit_rate={metrics.retrieval_hit_rate:.3f} "
+        f"any_hit={metrics.any_hit_rate:.3f} "
+        f"full_hit={metrics.full_hit_rate:.3f} "
+        f"partial_hit={metrics.partial_hit_rate:.3f} "
         f"query_failed={metrics.query_failed_rate:.3f}"
     )
 
@@ -122,8 +140,12 @@ def _build_flip_row(
         "should_refuse": bool(row_a.get("should_refuse", False)),
         "a_model_refused": bool(row_a.get("model_refused", False)),
         "b_model_refused": bool(row_b.get("model_refused", False)),
-        "a_retrieval_hit": row_a.get("retrieval_hit"),
-        "b_retrieval_hit": row_b.get("retrieval_hit"),
+        "a_any_hit": row_a.get("any_hit", row_a.get("retrieval_hit")),
+        "b_any_hit": row_b.get("any_hit", row_b.get("retrieval_hit")),
+        "a_full_hit": row_a.get("full_hit"),
+        "b_full_hit": row_b.get("full_hit"),
+        "a_partial_hit": row_a.get("partial_hit"),
+        "b_partial_hit": row_b.get("partial_hit"),
         "a_status": row_a.get("status"),
         "b_status": row_b.get("status"),
         "a_model": row_a.get("model"),
@@ -178,7 +200,9 @@ def main() -> int:
     print(f"  specificity      {_format_delta(metrics_a.specificity, metrics_b.specificity)}")
     print(f"  f1               {_format_delta(metrics_a.f1, metrics_b.f1)}")
     print(f"  refusal_rate     {_format_delta(metrics_a.refusal_rate_pred, metrics_b.refusal_rate_pred)}")
-    print(f"  retrieval_hit    {_format_delta(metrics_a.retrieval_hit_rate, metrics_b.retrieval_hit_rate)}")
+    print(f"  any_hit          {_format_delta(metrics_a.any_hit_rate, metrics_b.any_hit_rate)}")
+    print(f"  full_hit         {_format_delta(metrics_a.full_hit_rate, metrics_b.full_hit_rate)}")
+    print(f"  partial_hit      {_format_delta(metrics_a.partial_hit_rate, metrics_b.partial_hit_rate)}")
     print(f"  query_failed     {_format_delta(metrics_a.query_failed_rate, metrics_b.query_failed_rate)}")
 
     flips = [
@@ -188,15 +212,30 @@ def main() -> int:
         != bool(aligned_b[row_id].get("model_refused", False))
     ]
 
-    retrieval_flips = [
+    any_hit_flips = [
         row_id
         for row_id in common_ids
-        if aligned_a[row_id].get("retrieval_hit") != aligned_b[row_id].get("retrieval_hit")
+        if _coalesce_bool(aligned_a[row_id], "any_hit", "retrieval_hit")
+        != _coalesce_bool(aligned_b[row_id], "any_hit", "retrieval_hit")
+    ]
+    full_hit_flips = [
+        row_id
+        for row_id in common_ids
+        if _coalesce_bool(aligned_a[row_id], "full_hit")
+        != _coalesce_bool(aligned_b[row_id], "full_hit")
+    ]
+    partial_hit_flips = [
+        row_id
+        for row_id in common_ids
+        if _coalesce_bool(aligned_a[row_id], "partial_hit")
+        != _coalesce_bool(aligned_b[row_id], "partial_hit")
     ]
 
     print()
     print(f"Refusal flips (A != B): {len(flips)}")
-    print(f"Retrieval-hit flips    : {len(retrieval_flips)}")
+    print(f"Any-hit flips         : {len(any_hit_flips)}")
+    print(f"Full-hit flips        : {len(full_hit_flips)}")
+    print(f"Partial-hit flips     : {len(partial_hit_flips)}")
 
     shown = flips[: max(0, args.show)]
     for row in shown:
@@ -205,8 +244,12 @@ def main() -> int:
             f"should_refuse={int(row['should_refuse'])} "
             f"A_refused={int(row['a_model_refused'])} "
             f"B_refused={int(row['b_model_refused'])} "
-            f"A_hit={row['a_retrieval_hit']} "
-            f"B_hit={row['b_retrieval_hit']} :: "
+            f"A_any={row['a_any_hit']} "
+            f"B_any={row['b_any_hit']} "
+            f"A_full={row['a_full_hit']} "
+            f"B_full={row['b_full_hit']} "
+            f"A_partial={row['a_partial_hit']} "
+            f"B_partial={row['b_partial_hit']} :: "
             f"{row['question']}"
         )
 
