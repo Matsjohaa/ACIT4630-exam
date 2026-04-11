@@ -1,29 +1,4 @@
-"""Headless refusal testing for the TEK17 RAG system (no Streamlit UI).
-
-Supports two modes:
-
-- local: runs retrieval + embed + LLM directly (no FastAPI server needed)
-- server: sends requests to a running FastAPI server (/query)
-
-Examples:
-
-    # Single question (local mode)
-    python analysis/scripts/test_refusal.py \
-        --question "Kan jeg bygge rekkverk med 80 cm høyde?" \
-        --mode local
-
-    # Batch eval (local mode)
-    python analysis/scripts/test_refusal.py \
-        --eval-file analysis/questions/tek17_eval_questions.example.jsonl \
-        --mode local \
-        --out analysis/logging/refusal_runs.example.jsonl
-
-    # Batch eval (server mode; requires: python -m tek17 serve)
-    python analysis/scripts/test_refusal.py \
-        --eval-file analysis/questions/tek17_eval_questions.dibk_example.jsonl \
-        --mode server \
-        --server-url http://localhost:8000
-"""
+"""Headless refusal testing for the TEK17 RAG system."""
 
 from __future__ import annotations
 
@@ -35,45 +10,68 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Literal
 
-from tek17.rag.prompts import SYSTEM_PROMPT, SYSTEM_PROMPT_SHA256
-from tek17.rag.config import PROMPT_VERSION
-
-
-DEFAULT_SERVER_URL = "http://localhost:8000"
+from tek17.rag.config import (
+    CHROMA_COLLECTION,
+    CHROMA_DIR,
+    CHUNKS_PATH,
+    COLLECTION_STATS_TIMEOUT_S,
+    CONTENT_STOPWORDS,
+    CONTENT_WORD_MIN_LEN,
+    EMBED_BASE_URL,
+    EMBED_MODEL,
+    EMBED_PROVIDER,
+    EVAL_MODE,
+    GROUNDEDNESS_THRESHOLD,
+    HYBRID_ALPHA,
+    LLM_BASE_URL,
+    LLM_MODEL,
+    LLM_PROVIDER,
+    LLM_TEMPERATURE,
+    PROMPT_VERSION,
+    REFUSAL_PATTERNS,
+    REFUSAL_TAG,
+    REQUEST_TIMEOUT_S,
+    RETRIEVAL_METHOD,
+    SERVER_URL,
+    SOURCE_PREVIEW_LIMIT,
+    TOP_K,
+    WILSON_Z,
+)
+from tek17.rag.ingest import embed_query
+from tek17.rag.llm.dispatcher import chat_result
+from tek17.rag.prompts import get_system_prompt, get_system_prompt_sha256
+from tek17.rag.retrieval.client import get_collection, retrieve, vectorstore_snapshot
 
 
 Mode = Literal["local", "server"]
+Provider = Literal["ollama", "openai"]
+VALID_PROMPT_VERSIONS = {"baseline", "relaxed", "strict"}
 
 
 @dataclass(frozen=True)
 class RunConfig:
     mode: Mode
-
-    # Common
     top_k: int
     model: str | None
     temperature: float | None
-
     retrieval_method: str
     hybrid_alpha: float
-
-    # Server mode
     server_url: str
-
-    # Local mode
     chroma_dir: Path
     collection: str
-    ollama_url: str
-    llm_provider: Literal["ollama", "openai"]
-    embed_provider: Literal["ollama", "openai"]
+    embed_base_url: str | None
+    llm_provider: Provider
+    embed_provider: Provider
     llm_model: str
     embed_model: str
+    llm_base_url: str | None
+    prompt_version: str
 
 
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
+    with path.open("r", encoding="utf-8") as file:
+        for line in file:
             line = line.strip()
             if not line:
                 continue
@@ -83,24 +81,30 @@ def _load_jsonl(path: Path) -> list[dict[str, Any]]:
 
 def _write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
+    with path.open("w", encoding="utf-8") as file:
         for row in rows:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            file.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def _normalize_retrieval_method(method: str) -> str:
+    normalized = (method or RETRIEVAL_METHOD).strip().lower()
+    if normalized == "sparce":
+        return "sparse"
+    return normalized
+
+
+def _normalize_prompt_version(version: str) -> str:
+    return (version or PROMPT_VERSION).strip().lower()
 
 
 def _has_refusal_tag(answer: str) -> bool:
     text = (answer or "").strip().lower()
     if not text:
         return False
-    # Allow the model to wrap it in quotes and/or omit the colon.
-    return "kan_ikke_svare" in text
+    return REFUSAL_TAG.lower() in text
 
 
 def _classify_refusal(answer: str) -> bool:
-    """Simple heuristic refusal detector.
-
-    """
-
     text = (answer or "").strip().lower()
     if not text:
         return True
@@ -108,156 +112,86 @@ def _classify_refusal(answer: str) -> bool:
     if _has_refusal_tag(text):
         return True
 
-    patterns = [
-        # Norwegian-ish
-        "kan ikke svare",
-        "kan ikke gi et sikkert svar",
-        "kan ikke gi et konkret svar",
-        "har ikke nok informasjon",
-        "finner ikke nok informasjon",
-        "ikke nok informasjon",
-        "mangler informasjon",
-        "har ikke grunnlag",
-        "finner ikke grunnlag",
-        "utenfor det som dekkes av tek17",
-        "utenfor tek17",
-        # English-ish
-        "i can't answer",
-        "i cannot answer",
-        "i don't have enough information",
-        "not enough information",
-        "outside the scope",
-    ]
-    return any(p in text for p in patterns)
-
-
-_STOPWORDS = {
-    "og",
-    "eller",
-    "som",
-    "med",
-    "for",
-    "til",
-    "av",
-    "på",
-    "i",
-    "jf",
-    "kapittel",
-    "paragraf",
-    "ledd",
-    "bokstav",
-    "gjelder",
-    "skal",
-    "kan",
-    "må",
-    "ikke",
-    "det",
-    "den",
-    "de",
-    "et",
-    "en",
-    "er",
-    "å",
-    "når",
-    "hva",
-    "hvordan",
-    "hvilke",
-    "hvilken",
-    "hvor",
-    "jeg",
-    "du",
-    "vi",
-    "man",
-    "teK17".lower(),
-}
+    return any(pattern in text for pattern in REFUSAL_PATTERNS)
 
 
 def _content_words(text: str) -> set[str]:
-    t = (text or "").lower()
-    # Keep letters (incl. Norwegian) and digits.
-    t = re.sub(r"[^0-9a-zæøå]+", " ", t)
-    words = {w for w in t.split() if len(w) >= 4 and w not in _STOPWORDS}
-    return words
+    normalized = re.sub(r"[^0-9a-zæøå]+", " ", (text or "").lower())
+    return {
+        word
+        for word in normalized.split()
+        if len(word) >= CONTENT_WORD_MIN_LEN and word not in CONTENT_STOPWORDS
+    }
 
 
 def _groundedness_score(answer: str, sources: list[dict[str, Any]]) -> float:
-    """Heuristic grounding score in [0,1].
-
-    Measures overlap between answer content-words and retrieved context text.
-    This is intentionally lightweight: it won't prove correctness, but it *will*
-    catch many cases where the model answers confidently without using the context.
-    """
-
-    a_words = _content_words(answer)
-    if not a_words:
+    answer_words = _content_words(answer)
+    if not answer_words:
         return 0.0
 
-    ctx_parts: list[str] = []
-    for s in sources or []:
-        txt = (s or {}).get("text")
-        if isinstance(txt, str) and txt.strip():
-            ctx_parts.append(txt)
+    context_parts: list[str] = []
+    for source in sources or []:
+        text = (source or {}).get("text")
+        if isinstance(text, str) and text.strip():
+            context_parts.append(text)
 
-    if not ctx_parts:
+    if not context_parts:
         return 0.0
 
-    c_words = _content_words("\n".join(ctx_parts))
-    if not c_words:
+    context_words = _content_words("\n".join(context_parts))
+    if not context_words:
         return 0.0
 
-    overlap = len(a_words.intersection(c_words))
-    return overlap / max(1, len(a_words))
+    overlap = len(answer_words.intersection(context_words))
+    return overlap / max(1, len(answer_words))
 
 
 def _safe_div(num: float, den: float) -> float:
     return num / den if den else 0.0
 
 
-def _wilson_ci(successes: int, n: int, z: float = 1.96) -> tuple[float, float]:
-    """Wilson score interval for a binomial proportion.
-
-    Returns (low, high). If n==0 returns (0, 0).
-    """
+def _wilson_ci(successes: int, n: int, z: float = WILSON_Z) -> tuple[float, float]:
     if n <= 0:
         return 0.0, 0.0
+
     phat = successes / n
     denom = 1.0 + (z * z) / n
     center = (phat + (z * z) / (2.0 * n)) / denom
-    half = (z / denom) * math.sqrt((phat * (1.0 - phat) / n) + (z * z) / (4.0 * n * n))
-    lo = max(0.0, center - half)
-    hi = min(1.0, center + half)
-    return lo, hi
+    half = (z / denom) * math.sqrt(
+        (phat * (1.0 - phat) / n) + (z * z) / (4.0 * n * n)
+    )
+    return max(0.0, center - half), min(1.0, center + half)
 
 
 def _compute_refusal_metrics(tp: int, fp: int, tn: int, fn: int) -> dict[str, float]:
-    """Compute standard metrics treating 'refuse' as the positive class."""
     total = tp + fp + tn + fn
-    accuracy = _safe_div(tp + tn, total)
-
     precision = _safe_div(tp, tp + fp)
-    recall = _safe_div(tp, tp + fn)  # TPR / sensitivity
-    specificity = _safe_div(tn, tn + fp)  # TNR
+    recall = _safe_div(tp, tp + fn)
+    specificity = _safe_div(tn, tn + fp)
     f1 = _safe_div(2.0 * precision * recall, precision + recall)
     balanced_accuracy = 0.5 * (recall + specificity)
 
-    # Matthews correlation coefficient
     denom = math.sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
     mcc = ((tp * tn) - (fp * fn)) / denom if denom else 0.0
 
-    refusal_rate_pred = _safe_div(tp + fp, total)
-    refusal_rate_true = _safe_div(tp + fn, total)
-
     return {
-        "accuracy": accuracy,
+        "accuracy": _safe_div(tp + tn, total),
         "precision": precision,
         "recall": recall,
         "specificity": specificity,
         "f1": f1,
         "balanced_accuracy": balanced_accuracy,
         "mcc": mcc,
-        "refusal_rate_pred": refusal_rate_pred,
-        "refusal_rate_true": refusal_rate_true,
+        "refusal_rate_pred": _safe_div(tp + fp, total),
+        "refusal_rate_true": _safe_div(tp + fn, total),
     }
+
+
+def _normalize_section_id(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    normalized = normalized.replace("§", "")
+    normalized = " ".join(normalized.split())
+    return normalized
 
 
 def _retrieval_hit(sources: list[dict[str, Any]], target_sections: list[str]) -> bool:
@@ -265,11 +199,15 @@ def _retrieval_hit(sources: list[dict[str, Any]], target_sections: list[str]) ->
         return False
 
     retrieved = {
-        str((s or {}).get("section_id", "")).strip()
-        for s in sources
-        if str((s or {}).get("section_id", "")).strip()
+        _normalize_section_id((source or {}).get("section_id", ""))
+        for source in sources
+        if str((source or {}).get("section_id", "")).strip()
     }
-    targets = {str(t).strip() for t in target_sections if str(t).strip()}
+    targets = {
+        _normalize_section_id(target)
+        for target in target_sections
+        if str(target).strip()
+    }
     return not retrieved.isdisjoint(targets)
 
 
@@ -281,39 +219,38 @@ def _query_server(question: str, cfg: RunConfig) -> dict[str, Any]:
         "top_k": cfg.top_k,
         "retrieval_method": cfg.retrieval_method,
         "hybrid_alpha": cfg.hybrid_alpha,
+        "prompt_version": cfg.prompt_version,
     }
     if cfg.model is not None:
         payload["model"] = cfg.model
     if cfg.temperature is not None:
         payload["temperature"] = cfg.temperature
 
-    resp = requests.post(f"{cfg.server_url}/query", json=payload, timeout=180)
-    resp.raise_for_status()
-    return resp.json()
+    response = requests.post(
+        f"{cfg.server_url}/query",
+        json=payload,
+        timeout=REQUEST_TIMEOUT_S,
+    )
+    response.raise_for_status()
+    return response.json()
 
 
 def _query_local(question: str, cfg: RunConfig) -> dict[str, Any]:
-    from tek17.rag.embedding.client import embed_query
-    from tek17.rag.llm.client import chat_result
-    from tek17.rag.retrieval.client import get_collection, retrieve
-
     collection = get_collection(cfg.chroma_dir, cfg.collection)
 
-    q_embedding: list[float] | None = None
+    query_embedding: list[float] | None = None
     if cfg.retrieval_method in {"dense", "hybrid"}:
-        q_embedding = embed_query(
+        query_embedding = embed_query(
             question,
             provider=cfg.embed_provider,
             model=cfg.embed_model,
-            base_url=cfg.ollama_url,
+            base_url=cfg.embed_base_url,
         )
-
-    from tek17.rag.config import CHUNKS_PATH
 
     documents, metadatas, distances = retrieve(
         collection=collection,
         query_text=question,
-        query_embedding=q_embedding,
+        query_embedding=query_embedding,
         top_k=cfg.top_k,
         method=cfg.retrieval_method,
         chunks_path=CHUNKS_PATH,
@@ -322,48 +259,47 @@ def _query_local(question: str, cfg: RunConfig) -> dict[str, Any]:
 
     sources: list[dict[str, Any]] = []
     context_parts: list[str] = []
-    for doc, meta, dist in zip(documents, metadatas, distances):
-        context_parts.append(doc)
+
+    for document, metadata, distance in zip(documents, metadatas, distances):
+        context_parts.append(document)
         sources.append(
             {
-                "section_id": meta.get("section_id", ""),
-                "title": meta.get("title", ""),
-                "chapter": meta.get("chapter", ""),
-                "text_type": meta.get("text_type", ""),
-                "text": doc,
-                "distance": dist,
+                "section_id": metadata.get("section_id", ""),
+                "title": metadata.get("title", ""),
+                "chapter": metadata.get("chapter", ""),
+                "text_type": metadata.get("text_type", ""),
+                "text": document,
+                "distance": distance,
             }
         )
 
     context_block = "\n\n---\n\n".join(context_parts)
-
-    user_msg = (
+    user_message = (
         f"Kontekst fra TEK17:\n\n{context_block}\n\n"
         f"---\n\nSpørsmål: {question}"
     )
-
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_msg},
-    ]
+    system_prompt = get_system_prompt(cfg.prompt_version)
 
     result = chat_result(
-        messages,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ],
         provider=cfg.llm_provider,
         model=cfg.llm_model,
-        base_url=cfg.ollama_url,
-        temperature=cfg.temperature if cfg.temperature is not None else 0.3,
+        base_url=cfg.llm_base_url,
+        temperature=cfg.temperature if cfg.temperature is not None else LLM_TEMPERATURE,
     )
-    answer = result.content
 
     return {
-        "answer": answer,
+        "answer": result.content,
         "sources": sources,
         "model": cfg.llm_model,
         "question": question,
         "retrieval_method": cfg.retrieval_method,
         "llm_finish_reason": result.finish_reason,
         "llm_usage": result.usage,
+        "prompt_version": cfg.prompt_version,
     }
 
 
@@ -373,21 +309,25 @@ def _run_query(question: str, cfg: RunConfig) -> dict[str, Any]:
     return _query_local(question, cfg)
 
 
-def _print_sources(sources: list[dict[str, Any]], max_sources: int = 6) -> None:
-    shown = sources[:max_sources]
-    for i, s in enumerate(shown, start=1):
-        section_id = (s or {}).get("section_id", "")
-        title = (s or {}).get("title", "")
-        chapter = (s or {}).get("chapter", "")
-        text_type = (s or {}).get("text_type", "")
-        distance = (s or {}).get("distance", None)
+def _print_sources(
+    sources: list[dict[str, Any]],
+    max_sources: int = SOURCE_PREVIEW_LIMIT,
+) -> None:
+    for index, source in enumerate(sources[:max_sources], start=1):
+        section_id = (source or {}).get("section_id", "")
+        title = (source or {}).get("title", "")
+        chapter = (source or {}).get("chapter", "")
+        text_type = (source or {}).get("text_type", "")
+        distance = (source or {}).get("distance")
+
         label = f"{section_id} – {title}".strip(" –")
-        meta = " | ".join([p for p in [text_type, chapter] if p])
-        dist = f" (dist={distance:.4f})" if isinstance(distance, (float, int)) else ""
+        meta = " | ".join(part for part in [text_type, chapter] if part)
+        distance_text = f" (dist={distance:.4f})" if isinstance(distance, (float, int)) else ""
+
         if meta:
-            print(f"  [{i}] {label} [{meta}]{dist}")
+            print(f"  [{index}] {label} [{meta}]{distance_text}")
         else:
-            print(f"  [{i}] {label}{dist}")
+            print(f"  [{index}] {label}{distance_text}")
 
 
 def run_single(question: str, cfg: RunConfig) -> int:
@@ -402,6 +342,7 @@ def run_single(question: str, cfg: RunConfig) -> int:
     refused = _classify_refusal(answer)
 
     print(f"mode: {cfg.mode}")
+    print(f"prompt_version: {cfg.prompt_version}")
     print(f"refused: {refused}")
     print()
     print(answer)
@@ -419,6 +360,7 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
         print(f"ERROR: eval file not found: {eval_file}")
         return 2
 
+    prompt_sha256 = get_system_prompt_sha256(cfg.prompt_version)
     items = _load_jsonl(eval_file)
     if not items:
         print("ERROR: eval file is empty")
@@ -426,45 +368,34 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
 
     total = 0
     correct = 0
-
-    # Lightweight answer correctness rubric (see below):
-    # - For should_refuse items: correct iff model_refused
-    # - For in-scope items: correct iff model did NOT refuse AND retrieved at least one target section
-    #   (this intentionally flags "non-refusal hallucinations" where the model answers without support)
     correct_answer = 0
-    incorrect_answer = 0
+    correct_answer_strict = 0
     unsupported_non_refusal = 0
     ungrounded_non_refusal = 0
-    correct_answer_strict = 0
-    incorrect_answer_strict = 0
     query_failed = 0
 
     tp_refuse = fp_refuse = tn_refuse = fn_refuse = 0
-    # Stratified by retrieval hit
     tp_hit = fp_hit = tn_hit = fn_hit = 0
     tp_miss = fp_miss = tn_miss = fn_miss = 0
 
-    # Split refusal questions by refusal_type (optional field on dataset items)
-    refuse_type_counts: dict[str, int] = {}
-    refuse_type_refused: dict[str, int] = {}
-
+    refusal_type_counts: dict[str, int] = {}
+    refusal_type_refused: dict[str, int] = {}
     rows_out: list[dict[str, Any]] = []
 
-    # Vectorstore snapshot (local mode only; cached in the client)
     vs_snapshot: dict[str, Any] | None = None
     if cfg.mode == "local":
         try:
-            from tek17.rag.retrieval.client import vectorstore_snapshot
-
             vs_snapshot = vectorstore_snapshot(cfg.chroma_dir, cfg.collection)
         except Exception:
             vs_snapshot = None
     else:
-        # Best-effort: fetch count from the server
         try:
             import requests
 
-            stats = requests.get(f"{cfg.server_url}/collection/stats", timeout=10).json()
+            stats = requests.get(
+                f"{cfg.server_url}/collection/stats",
+                timeout=COLLECTION_STATS_TIMEOUT_S,
+            ).json()
             if isinstance(stats, dict) and "count" in stats:
                 vs_snapshot = {
                     "chroma_dir": None,
@@ -477,6 +408,7 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
             vs_snapshot = None
 
     print(f"mode: {cfg.mode}")
+    print(f"prompt_version: {cfg.prompt_version}")
     if cfg.mode == "server":
         print(f"server_url: {cfg.server_url}")
     else:
@@ -485,20 +417,16 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
     print("id\tshould_refuse\tmodel_refused\tretrieval_hit\tstatus")
 
     for item in items:
-        qid = str(item.get("id", ""))
+        question_id = str(item.get("id", ""))
         question = str(item.get("question", "")).strip()
         target_sections = item.get("target_sections") or []
         should_refuse = bool(item.get("should_refuse", False))
+
         question_type = item.get("question_type")
-        if isinstance(question_type, str):
-            question_type = question_type.strip() or None
-        else:
-            question_type = None
+        question_type = question_type.strip() if isinstance(question_type, str) and question_type.strip() else None
+
         refusal_type = item.get("refusal_type")
-        if isinstance(refusal_type, str):
-            refusal_type = refusal_type.strip() or None
-        else:
-            refusal_type = None
+        refusal_type = refusal_type.strip() if isinstance(refusal_type, str) and refusal_type.strip() else None
 
         if not question:
             continue
@@ -509,14 +437,14 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
             data = _run_query(question, cfg)
         except Exception as exc:
             query_failed += 1
-            incorrect_answer += 1
-            print(f"{qid}\t{should_refuse}\tERROR\t0\tquery_failed: {exc}")
+            print(f"{question_id}\t{should_refuse}\tERROR\t0\tquery_failed: {exc}")
+
             if out is not None:
                 rows_out.append(
                     {
-                        "prompt_version": PROMPT_VERSION,
-                        "system_prompt_sha256": SYSTEM_PROMPT_SHA256,
-                        "id": qid,
+                        "prompt_version": cfg.prompt_version,
+                        "system_prompt_sha256": prompt_sha256,
+                        "id": question_id,
                         "question": question,
                         "question_type": question_type,
                         "should_refuse": should_refuse,
@@ -543,10 +471,10 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
                         "top_k": cfg.top_k,
                         "retrieval_method": cfg.retrieval_method,
                         "hybrid_alpha": cfg.hybrid_alpha,
-                        "model": (cfg.model if cfg.mode == "server" else cfg.llm_model),
+                        "model": cfg.model if cfg.mode == "server" else cfg.llm_model,
                         "temperature": cfg.temperature,
-                        "embed_provider": (cfg.embed_provider if cfg.mode == "local" else None),
-                        "embed_model": (cfg.embed_model if cfg.mode == "local" else None),
+                        "embed_provider": cfg.embed_provider if cfg.mode == "local" else None,
+                        "embed_model": cfg.embed_model if cfg.mode == "local" else None,
                         "vectorstore": vs_snapshot,
                     }
                 )
@@ -554,21 +482,28 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
 
         answer = data.get("answer", "")
         sources = data.get("sources", []) or []
+        retrieval_hit = _retrieval_hit(
+            sources,
+            list(target_sections) if isinstance(target_sections, list) else [],
+        )
+        retrieved_section_ids = [
+            str((source or {}).get("section_id", "")).strip()
+            for source in sources
+        ]
 
-        llm_finish_reason = data.get("llm_finish_reason")
-        llm_usage = data.get("llm_usage")
+        # print(
+        #     f"DEBUG {question_id}: "
+        #     f"targets={target_sections} "
+        #     f"retrieved={retrieved_section_ids}"
+        # )
 
-        retrieval_hit = _retrieval_hit(sources, list(target_sections) if isinstance(target_sections, list) else [])
         refused_tagged = _has_refusal_tag(answer)
         refused_heuristic = _classify_refusal(answer)
         model_refused = refused_tagged or refused_heuristic
 
-        status = ""
-
         groundedness = _groundedness_score(answer, sources)
-        grounded = groundedness >= 0.25
+        grounded = groundedness >= GROUNDEDNESS_THRESHOLD
 
-        # Lightweight correctness/support labels.
         if should_refuse:
             answer_correct = bool(model_refused)
             answer_supported: bool | None = None
@@ -581,9 +516,9 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
             else:
                 answer_supported = bool(retrieval_hit)
                 answer_correct = bool(retrieval_hit)
-                # Strict: require both retrieval_hit AND that the answer appears grounded in retrieved text.
                 answer_correct_strict = bool(retrieval_hit) and bool(grounded)
 
+        status = ""
         if (not should_refuse) and (not model_refused) and retrieval_hit and (not grounded):
             ungrounded_non_refusal += 1
             status = "ungrounded_answer"
@@ -597,7 +532,6 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
             status = "correct_refusal"
         elif (not should_refuse) and (not model_refused):
             tn_refuse += 1
-            # If we already flagged this as unsupported, keep that.
             if status != "unsupported_answer":
                 status = "correct_answer"
         elif (not should_refuse) and model_refused:
@@ -607,12 +541,11 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
             fn_refuse += 1
             status = "under_refusal"
 
-        # Track refusal behaviour by refusal_type.
         if should_refuse:
             key = refusal_type or "(unspecified)"
-            refuse_type_counts[key] = refuse_type_counts.get(key, 0) + 1
+            refusal_type_counts[key] = refusal_type_counts.get(key, 0) + 1
             if model_refused:
-                refuse_type_refused[key] = refuse_type_refused.get(key, 0) + 1
+                refusal_type_refused[key] = refusal_type_refused.get(key, 0) + 1
 
         if retrieval_hit:
             if should_refuse and model_refused:
@@ -635,25 +568,19 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
 
         if (should_refuse and model_refused) or ((not should_refuse) and (not model_refused)):
             correct += 1
-
         if answer_correct:
             correct_answer += 1
-        else:
-            incorrect_answer += 1
-
         if answer_correct_strict:
             correct_answer_strict += 1
-        else:
-            incorrect_answer_strict += 1
 
-        print(f"{qid}\t{should_refuse}\t{model_refused}\t{int(retrieval_hit)}\t{status}")
+        print(f"{question_id}\t{should_refuse}\t{model_refused}\t{int(retrieval_hit)}\t{status}")
 
         if out is not None:
             rows_out.append(
                 {
-                    "prompt_version": PROMPT_VERSION,
-                    "system_prompt_sha256": SYSTEM_PROMPT_SHA256,
-                    "id": qid,
+                    "prompt_version": cfg.prompt_version,
+                    "system_prompt_sha256": prompt_sha256,
+                    "id": question_id,
                     "question": question,
                     "question_type": question_type,
                     "should_refuse": should_refuse,
@@ -667,22 +594,22 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
                     "answer_correct_strict": answer_correct_strict,
                     "answer_supported": answer_supported,
                     "unsupported_non_refusal": (not should_refuse) and (not model_refused) and (not retrieval_hit),
-                    "ungrounded_non_refusal": (not should_refuse) and (not model_refused) and bool(retrieval_hit) and (not grounded),
+                    "ungrounded_non_refusal": (not should_refuse) and (not model_refused) and retrieval_hit and (not grounded),
                     "groundedness_score": groundedness,
                     "answer_grounded": grounded if (not should_refuse) and (not model_refused) else None,
                     "target_sections": target_sections,
                     "answer": answer,
                     "sources": sources,
-                    "llm_finish_reason": llm_finish_reason,
-                    "llm_usage": llm_usage,
+                    "llm_finish_reason": data.get("llm_finish_reason"),
+                    "llm_usage": data.get("llm_usage"),
                     "mode": cfg.mode,
                     "top_k": cfg.top_k,
                     "retrieval_method": cfg.retrieval_method,
                     "hybrid_alpha": cfg.hybrid_alpha,
                     "model": data.get("model", cfg.model or cfg.llm_model),
                     "temperature": cfg.temperature,
-                    "embed_provider": (cfg.embed_provider if cfg.mode == "local" else None),
-                    "embed_model": (cfg.embed_model if cfg.mode == "local" else None),
+                    "embed_provider": cfg.embed_provider if cfg.mode == "local" else None,
+                    "embed_model": cfg.embed_model if cfg.mode == "local" else None,
                     "vectorstore": vs_snapshot,
                 }
             )
@@ -691,6 +618,7 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
         accuracy = correct / total
         acc_lo, acc_hi = _wilson_ci(correct, total)
         metrics = _compute_refusal_metrics(tp_refuse, fp_refuse, tn_refuse, fn_refuse)
+
         print()
         print(f"Total eval items: {total}")
         print(f"Refusal behaviour accuracy: {accuracy:.3f} (95% CI {acc_lo:.3f}–{acc_hi:.3f})")
@@ -710,39 +638,51 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
         print(f"  MCC                        : {metrics['mcc']:.3f}")
         print(f"  Refusal rate (pred / true) : {metrics['refusal_rate_pred']:.3f} / {metrics['refusal_rate_true']:.3f}")
 
-        print()
-        correctness_acc = (correct_answer / total) if total else 0.0
+        correctness_acc = correct_answer / total
         corr_lo, corr_hi = _wilson_ci(correct_answer, total)
+
+        print()
         print("Lightweight answer correctness (support-based):")
-        print(f"  accuracy                  : {correctness_acc:.3f} (95% CI {corr_lo:.3f}–{corr_hi:.3f})")
-        print(f"  unsupported_non_refusals   : {unsupported_non_refusal} ({(unsupported_non_refusal/total):.3f} of all items)")
-        print(f"  ungrounded_non_refusals    : {ungrounded_non_refusal} ({(ungrounded_non_refusal/total):.3f} of all items)")
-        print(f"  query_failed               : {query_failed} ({(query_failed/total):.3f} of all items)")
+        print(f"  accuracy                   : {correctness_acc:.3f} (95% CI {corr_lo:.3f}–{corr_hi:.3f})")
+        print(f"  unsupported_non_refusals   : {unsupported_non_refusal} ({(unsupported_non_refusal / total):.3f} of all items)")
+        print(f"  ungrounded_non_refusals    : {ungrounded_non_refusal} ({(ungrounded_non_refusal / total):.3f} of all items)")
+        print(f"  query_failed               : {query_failed} ({(query_failed / total):.3f} of all items)")
 
-        strict_acc = (correct_answer_strict / total) if total else 0.0
+        strict_acc = correct_answer_strict / total
         strict_lo, strict_hi = _wilson_ci(correct_answer_strict, total)
-        print("Strict answer correctness (retrieval_hit + groundedness):")
-        print(f"  accuracy                  : {strict_acc:.3f} (95% CI {strict_lo:.3f}–{strict_hi:.3f})")
 
-        # Stratified metrics can help distinguish retrieval issues from refusal logic.
+        print("Strict answer correctness (retrieval_hit + groundedness):")
+        print(f"  accuracy                   : {strict_acc:.3f} (95% CI {strict_lo:.3f}–{strict_hi:.3f})")
+
         n_hit = tp_hit + fp_hit + tn_hit + fn_hit
         n_miss = tp_miss + fp_miss + tn_miss + fn_miss
         if n_hit and n_miss:
-            m_hit = _compute_refusal_metrics(tp_hit, fp_hit, tn_hit, fn_hit)
-            m_miss = _compute_refusal_metrics(tp_miss, fp_miss, tn_miss, fn_miss)
+            metrics_hit = _compute_refusal_metrics(tp_hit, fp_hit, tn_hit, fn_hit)
+            metrics_miss = _compute_refusal_metrics(tp_miss, fp_miss, tn_miss, fn_miss)
+
             print()
             print("Breakdown by retrieval_hit:")
-            print(f"  retrieval_hit=1 (n={n_hit}) acc={m_hit['accuracy']:.3f} f1={m_hit['f1']:.3f} mcc={m_hit['mcc']:.3f}")
-            print(f"  retrieval_hit=0 (n={n_miss}) acc={m_miss['accuracy']:.3f} f1={m_miss['f1']:.3f} mcc={m_miss['mcc']:.3f}")
+            print(
+                f"  retrieval_hit=1 (n={n_hit}) "
+                f"acc={metrics_hit['accuracy']:.3f} "
+                f"f1={metrics_hit['f1']:.3f} "
+                f"mcc={metrics_hit['mcc']:.3f}"
+            )
+            print(
+                f"  retrieval_hit=0 (n={n_miss}) "
+                f"acc={metrics_miss['accuracy']:.3f} "
+                f"f1={metrics_miss['f1']:.3f} "
+                f"mcc={metrics_miss['mcc']:.3f}"
+            )
 
-        if refuse_type_counts:
+        if refusal_type_counts:
             print()
             print("Refusal questions by refusal_type:")
-            for k in sorted(refuse_type_counts.keys()):
-                n_k = refuse_type_counts[k]
-                refused_k = refuse_type_refused.get(k, 0)
-                rate_k = (refused_k / n_k) if n_k else 0.0
-                print(f"  {k}: n={n_k} refused={refused_k} rate={rate_k:.3f}")
+            for key in sorted(refusal_type_counts):
+                n_key = refusal_type_counts[key]
+                refused_key = refusal_type_refused.get(key, 0)
+                rate_key = refused_key / n_key if n_key else 0.0
+                print(f"  {key}: n={n_key} refused={refused_key} rate={rate_key:.3f}")
 
     if out is not None:
         _write_jsonl(out, rows_out)
@@ -757,50 +697,48 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Headless refusal testing for TEK17 RAG (no UI).",
     )
 
-    parser.add_argument("--mode", choices=["local", "server"], default="local")
+    parser.add_argument("--mode", choices=["local", "server"], default=EVAL_MODE)
 
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--question", type=str, help="Single question to probe")
-    group.add_argument("--eval-file", type=Path, help="Eval JSONL (see analysis/questions/)")
+    group.add_argument("--eval-file", type=Path, help="Eval JSONL file maintained manually")
 
-    parser.add_argument("--top-k", type=int, default=6)
-
+    parser.add_argument("--top-k", type=int, default=TOP_K)
     parser.add_argument(
         "--retrieval-method",
-        choices=["dense", "sparse", "sparce", "hybrid"],
-        default="dense",
-        help="Retrieval method for local mode.",
+        choices=["dense", "sparse", "hybrid", "sparce"],
+        default=RETRIEVAL_METHOD,
+        help="Retrieval method for the run.",
     )
     parser.add_argument(
         "--hybrid-alpha",
         type=float,
-        default=0.5,
+        default=HYBRID_ALPHA,
         help="Hybrid weighting: alpha*dense + (1-alpha)*sparse.",
     )
 
-    # Common overrides
-    parser.add_argument("--model", type=str, default=None, help="Override model (server mode only)")
+    parser.add_argument("--model", type=str, default=None, help="Model override in server mode")
     parser.add_argument("--temperature", type=float, default=None)
-
-    # Server mode
-    parser.add_argument("--server-url", type=str, default=DEFAULT_SERVER_URL)
-
-    # Local mode
-    parser.add_argument("--chroma-dir", type=Path, default=Path("data/vectorstore/chroma"))
-    parser.add_argument("--collection", type=str, default="tek17")
-
-    parser.add_argument("--ollama-url", type=str, default="http://localhost:11434")
-    parser.add_argument("--llm-provider", choices=["ollama", "openai"], default="ollama")
-    parser.add_argument("--embed-provider", choices=["ollama", "openai"], default="ollama")
-
-    parser.add_argument("--llm-model", type=str, default="llama3.2")
-    parser.add_argument("--embed-model", type=str, default="nomic-embed-text")
+    parser.add_argument("--server-url", type=str, default=SERVER_URL)
+    parser.add_argument("--chroma-dir", type=Path, default=CHROMA_DIR)
+    parser.add_argument("--collection", type=str, default=CHROMA_COLLECTION)
+    parser.add_argument("--embed-base-url", type=str, default=EMBED_BASE_URL)
+    parser.add_argument("--llm-provider", choices=["ollama", "openai"], default=LLM_PROVIDER)
+    parser.add_argument("--embed-provider", choices=["ollama", "openai"], default=EMBED_PROVIDER)
+    parser.add_argument("--llm-model", type=str, default=LLM_MODEL)
+    parser.add_argument("--embed-model", type=str, default=EMBED_MODEL)
 
     parser.add_argument(
         "--out",
         type=Path,
         default=None,
-        help="Write detailed per-item results as JSONL (batch mode only)",
+        help="Write detailed per-item results as JSONL in batch mode",
+    )
+    parser.add_argument(
+        "--prompt-version",
+        type=str,
+        default=PROMPT_VERSION,
+        help="Prompt variant to use: baseline, relaxed, or strict",
     )
 
     return parser
@@ -809,25 +747,31 @@ def _build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = _build_parser().parse_args()
 
-    retrieval_method = str(args.retrieval_method).strip().lower()
-    if retrieval_method == "sparce":
-        retrieval_method = "sparse"
+    prompt_version = _normalize_prompt_version(args.prompt_version)
+    if prompt_version not in VALID_PROMPT_VERSIONS:
+        print(
+            "ERROR: invalid --prompt-version. "
+            f"Expected one of: {', '.join(sorted(VALID_PROMPT_VERSIONS))}"
+        )
+        return 2
 
     cfg = RunConfig(
         mode=args.mode,
         top_k=args.top_k,
         model=args.model,
         temperature=args.temperature,
-        retrieval_method=retrieval_method,
+        retrieval_method=_normalize_retrieval_method(args.retrieval_method),
         hybrid_alpha=float(args.hybrid_alpha),
         server_url=args.server_url,
         chroma_dir=args.chroma_dir,
         collection=args.collection,
-        ollama_url=args.ollama_url,
+        embed_base_url=args.embed_base_url,
         llm_provider=args.llm_provider,
         embed_provider=args.embed_provider,
         llm_model=args.llm_model,
         embed_model=args.embed_model,
+        llm_base_url=LLM_BASE_URL,
+        prompt_version=prompt_version,
     )
 
     if args.question is not None:
@@ -836,11 +780,6 @@ def main() -> int:
             print("ERROR: --question was provided but is empty")
             return 2
         return run_single(question, cfg)
-
-    # eval-file
-    if cfg.mode == "server" and args.out is not None:
-        # Still fine; just clarify in output that this is from the server.
-        pass
 
     if args.eval_file is None:
         print("ERROR: --eval-file is required in eval mode")

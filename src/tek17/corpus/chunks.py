@@ -1,274 +1,307 @@
 from __future__ import annotations
 
-from pathlib import Path
 import json
 import re
+from pathlib import Path
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 DEFAULT_JSONL_PATH = Path("data/processed/tek17_dibk.jsonl")
 DEFAULT_CHUNKS_PATH = Path("data/processed/tek17_chunks.jsonl")
 
-CHUNK_SIZE = 800
-CHUNK_OVERLAP = 200
+from tek17.rag.config import CHUNK_SIZE, CHUNK_OVERLAP
+
+HEADER_BODY_SEPARATOR = "\n\n"
+FALLBACK_SEPARATORS = ["\n\n", "\n", ". ", " ", ""]
+
+LEDD_START_RE = re.compile(r"^\(\d+\)\s+")
+LETTER_ITEM_RE = re.compile(r"^[a-zæøå]\)\s+", re.IGNORECASE)
+NUMBER_ITEM_RE = re.compile(r"^\d+\)\s+")
+BULLET_RE = re.compile(r"^[\-–•]\s+")
 
 
-_LEDD_START_RE = re.compile(r"^\(\d+\)\s+")
-_LETTER_ITEM_RE = re.compile(r"^[a-zæøå]\)\s+", re.IGNORECASE)
-_NUM_ITEM_RE = re.compile(r"^\d+\)\s+")
-_BULLET_RE = re.compile(r"^[\-–•]\s+")
-
-
-def _load_jsonl(path: Path) -> list[dict]:
+def load_jsonl_records(path: Path) -> list[dict]:
+    """Load JSONL records from disk."""
     records: list[dict] = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
+
+    with path.open("r", encoding="utf-8") as file:
+        for line in file:
             line = line.strip()
             if not line:
                 continue
             records.append(json.loads(line))
+
     return records
 
 
-def _build_documents(records: list[dict]) -> list[tuple[str, dict]]:
-    """Turn provision records into (text, metadata) pairs ready for chunking.
-
-    Each provision produces up to TWO documents:
-    1. Regulation text   (tag: regulation)
-    2. Guidance text     (tag: guidance)
-
-    This separation lets downstream retrieval experiments ablate reg-only
-    vs reg+guidance.
+def build_documents(records: list[dict]) -> list[tuple[str, dict]]:
     """
-    docs: list[tuple[str, dict]] = []
-    for rec in records:
-        section_id = rec.get("section_id", "unknown") or "unknown"
-        title = rec.get("title", "") or ""
-        chapter = rec.get("chapter", "") or ""
+    Build chunkable documents from parsed TEK17 provision records.
 
-        base_meta = {
+    Each provision may produce:
+    - one regulation document
+    - one guidance document
+    """
+    documents: list[tuple[str, dict]] = []
+
+    for record in records:
+        section_id = record.get("section_id") or "unknown"
+        title = record.get("title") or ""
+        chapter = record.get("chapter") or ""
+
+        base_metadata = {
             "source": "dibk",
             "section_id": section_id,
             "title": title,
             "chapter": chapter,
         }
 
-        reg = (rec.get("reg_text", "") or "").strip()
-        if reg:
-            meta = {**base_meta, "text_type": "regulation"}
+        regulation_text = (record.get("reg_text") or "").strip()
+        if regulation_text:
+            metadata = {**base_metadata, "text_type": "regulation"}
             header = f"{section_id} – {title}\n(Forskriftstekst)\n\n"
-            docs.append((header + reg, meta))
+            documents.append((header + regulation_text, metadata))
 
-        guidance = (rec.get("guidance_text", "") or "").strip()
-        if guidance:
-            meta = {**base_meta, "text_type": "guidance"}
+        guidance_text = (record.get("guidance_text") or "").strip()
+        if guidance_text:
+            metadata = {**base_metadata, "text_type": "guidance"}
             header = f"{section_id} – {title}\n(Veiledning)\n\n"
-            docs.append((header + guidance, meta))
+            documents.append((header + guidance_text, metadata))
 
-    return docs
+    return documents
 
 
-def _split_into_units(text: str) -> list[str]:
-    """Split TEK17 text into paragraph/ledd-ish units.
+def is_structural_boundary(line: str) -> bool:
+    """Return true if a line looks like the start of a new regulatory unit."""
+    return bool(
+        LEDD_START_RE.match(line)
+        or LETTER_ITEM_RE.match(line)
+        or NUMBER_ITEM_RE.match(line)
+        or BULLET_RE.match(line)
+    )
 
-    We work on the *already extracted* plain text and use simple heuristics
-    based on common markers in Norwegian regulations:
-    - (1), (2), ... (ledd)
-    - a), b), ... (lettered list items)
-    - 1), 2), ... (numbered list items)
-    - -, – , • (bullets)
 
-    If no markers are found, we fall back to a single unit.
+def split_into_structural_units(text: str) -> list[str]:
     """
-    lines = [ln.strip() for ln in text.splitlines()]
-    lines = [ln for ln in lines if ln]
+    Split TEK17 text into structure-aware units using simple formatting cues.
+
+    The goal is to preserve regulation-like boundaries such as:
+    - ledd: (1), (2), ...
+    - lettered lists: a), b), ...
+    - numbered lists: 1), 2), ...
+    - bullets: -, –, •
+    """
+    lines = [line.strip() for line in text.splitlines()]
+    lines = [line for line in lines if line]
+
     if not lines:
         return []
 
-    def is_new_unit(line: str) -> bool:
-        return bool(
-            _LEDD_START_RE.match(line)
-            or _LETTER_ITEM_RE.match(line)
-            or _NUM_ITEM_RE.match(line)
-            or _BULLET_RE.match(line)
-        )
-
     units: list[str] = []
-    buf: list[str] = []
+    current_unit: list[str] = []
+
     for line in lines:
-        if buf and is_new_unit(line):
-            units.append("\n".join(buf).strip())
-            buf = [line]
+        if current_unit and is_structural_boundary(line):
+            units.append("\n".join(current_unit).strip())
+            current_unit = [line]
         else:
-            buf.append(line)
+            current_unit.append(line)
 
-    if buf:
-        units.append("\n".join(buf).strip())
+    if current_unit:
+        units.append("\n".join(current_unit).strip())
 
-    # Avoid producing lots of tiny one-liners if the heuristic triggers too often.
-    # If *almost every* line became its own unit, treat the whole text as one unit.
+    # If nearly every line became its own unit, the heuristic is too aggressive.
     if len(lines) >= 8 and len(units) >= len(lines) - 1:
         return ["\n".join(lines).strip()]
 
     return units
 
 
-def _pack_units_into_chunks(
-    *,
-    header: str,
-    units: list[str],
-    chunk_size: int,
-    chunk_overlap: int,
-) -> list[tuple[str, int, int]]:
-    """Pack units into size-limited chunks with overlap at unit boundaries.
+def build_fallback_splitter(chunk_size: int, chunk_overlap: int) -> RecursiveCharacterTextSplitter:
+    """Create a generic character-based fallback splitter."""
+    return RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        separators=FALLBACK_SEPARATORS,
+    )
 
-    Returns a list of (chunk_text, unit_start_index, unit_end_index) where
-    indices are 1-based and inclusive.
+
+def split_large_unit(
+        *,
+        header: str,
+        unit: str,
+        unit_index: int,
+        chunk_size: int,
+        chunk_overlap: int,
+) -> list[tuple[str, int, int]]:
+    """Split one oversized structural unit using character-based fallback chunking."""
+    max_body_size = max(1, chunk_size - len(header))
+    adjusted_overlap = min(chunk_overlap, max(0, max_body_size - 1))
+
+    splitter = build_fallback_splitter(
+        chunk_size=max_body_size,
+        chunk_overlap=adjusted_overlap,
+    )
+
+    return [
+        (header + part, unit_index, unit_index)
+        for part in splitter.split_text(unit)
+    ]
+
+
+def pack_units_into_chunks(
+        *,
+        header: str,
+        units: list[str],
+        chunk_size: int,
+        chunk_overlap: int,
+) -> list[tuple[str, int, int]]:
+    """
+    Pack structural units into chunks.
+
+    Returns:
+        list of (chunk_text, unit_start_index, unit_end_index)
+    where indices are 1-based and inclusive.
     """
     if not units:
         return []
 
-    sep = "\n\n"
-    header_len = len(header)
-
-    def units_len(slice_units: list[str]) -> int:
-        if not slice_units:
-            return 0
-        return len(sep.join(slice_units))
-
     chunks: list[tuple[str, int, int]] = []
-    start = 0
+    separator = HEADER_BODY_SEPARATOR
+    header_length = len(header)
+    start_index = 0
 
-    # Fallback splitter for a single very large unit.
-    fallback_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=max(1, chunk_size - header_len),
-        chunk_overlap=min(chunk_overlap, max(0, chunk_size - header_len - 1)),
-        separators=["\n\n", "\n", ". ", " ", ""],
-    )
+    while start_index < len(units):
+        max_body_size = max(1, chunk_size - header_length)
 
-    while start < len(units):
-        max_body_len = max(1, chunk_size - header_len)
-
-        # Single unit too large: split it with fallback splitter.
-        if len(units[start]) > max_body_len:
-            unit_index = start + 1
-            for part in fallback_splitter.split_text(units[start]):
-                chunks.append((header + part, unit_index, unit_index))
-            start += 1
+        if len(units[start_index]) > max_body_size:
+            chunks.extend(
+                split_large_unit(
+                    header=header,
+                    unit=units[start_index],
+                    unit_index=start_index + 1,
+                    chunk_size=chunk_size,
+                    chunk_overlap=chunk_overlap,
+                )
+            )
+            start_index += 1
             continue
 
-        end = start
-        cur_units: list[str] = []
-        cur_len = 0
+        end_index = start_index
+        current_units: list[str] = []
+        current_length = 0
 
-        while end < len(units):
-            unit = units[end]
-            add_len = len(unit) + (len(sep) if cur_units else 0)
-            if header_len + cur_len + add_len <= chunk_size or not cur_units:
-                cur_units.append(unit)
-                cur_len += add_len
-                end += 1
+        while end_index < len(units):
+            unit = units[end_index]
+            added_length = len(unit) + (len(separator) if current_units else 0)
+
+            if header_length + current_length + added_length <= chunk_size or not current_units:
+                current_units.append(unit)
+                current_length += added_length
+                end_index += 1
             else:
                 break
 
-        chunk_text = header + sep.join(cur_units)
-        chunks.append((chunk_text, start + 1, end))
+        chunk_text = header + separator.join(current_units)
+        chunks.append((chunk_text, start_index + 1, end_index))
 
-        if end >= len(units):
+        if end_index >= len(units):
             break
 
         if chunk_overlap <= 0:
-            start = end
+            start_index = end_index
             continue
 
-        # Determine new start based on overlap budget (in characters), but avoid stalling.
         overlap_chars = 0
-        overlap_start = end
-        while overlap_start > start:
-            overlap_start -= 1
-            overlap_chars += len(units[overlap_start]) + len(sep)
+        next_start_index = end_index
+
+        while next_start_index > start_index:
+            next_start_index -= 1
+            overlap_chars += len(units[next_start_index]) + len(separator)
             if overlap_chars >= chunk_overlap:
                 break
 
-        if overlap_start <= start:
-            overlap_start = max(start + 1, end - 1)
+        if next_start_index <= start_index:
+            next_start_index = max(start_index + 1, end_index - 1)
 
-        start = overlap_start
+        start_index = next_start_index
 
     return chunks
 
 
-def build_and_save_chunks(
-    jsonl_path: Path = DEFAULT_JSONL_PATH,
-    chunks_path: Path = DEFAULT_CHUNKS_PATH,
-    chunk_size: int = CHUNK_SIZE,
-    chunk_overlap: int = CHUNK_OVERLAP,
-) -> None:
-    """Read the TEK17 JSONL corpus and write chunked records to JSONL.
-
-    Output format (one JSON object per line):
-    {
-      "text": str,
-      "metadata": { ... }
-    }
+def split_header_and_body(text: str) -> tuple[str, str]:
     """
-    jsonl_path = jsonl_path.resolve()
-    chunks_path = chunks_path.resolve()
+    Split a document into header and body.
 
-    if not jsonl_path.exists():
-        raise FileNotFoundError(
-            f"JSONL corpus not found: {jsonl_path}\n"
-            "Run `python -m tek17 download-dibk` then `python -m tek17 parse-dibk` first."
-        )
+    Expected document format:
+        § x-y – Title
+        (Forskriftstekst|Veiledning)
 
-    records = _load_jsonl(jsonl_path)
-    docs = _build_documents(records)
+        <body>
+    """
+    if HEADER_BODY_SEPARATOR not in text:
+        return "", text
 
-    # We chunk at paragraph/ledd-ish boundaries first, then pack into chunks.
-    # This keeps chunks aligned with regulation structure better than pure
-    # character-based splitting.
+    header, body = text.split(HEADER_BODY_SEPARATOR, 1)
+    return header + HEADER_BODY_SEPARATOR, body
 
-    chunks_path.parent.mkdir(parents=True, exist_ok=True)
 
-    count = 0
-    with chunks_path.open("w", encoding="utf-8") as f:
-        for text, meta in docs:
-            # Keep the first two lines as a header and chunk the remaining body.
-            # Header format from _build_documents():
-            #   "§ x-y – Title\n(<type>)\n\n"
-            if "\n\n" in text:
-                header, body = text.split("\n\n", 1)
-                header = header + "\n\n"
-            else:
-                header, body = "", text
+def write_chunk_record(file, text: str, metadata: dict) -> None:
+    """Write one chunk record as JSONL."""
+    record = {
+        "text": text,
+        "metadata": metadata,
+    }
+    file.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-            units = _split_into_units(body)
-            packed = _pack_units_into_chunks(
+
+def build_and_save_chunks(
+        jsonl_path: Path = DEFAULT_JSONL_PATH,
+        chunks_path: Path = DEFAULT_CHUNKS_PATH,
+        chunk_size: int = CHUNK_SIZE,
+        chunk_overlap: int = CHUNK_OVERLAP,
+) -> None:
+    """Read parsed TEK17 records and write chunked JSONL output."""
+    resolved_jsonl_path = jsonl_path.resolve()
+    resolved_chunks_path = chunks_path.resolve()
+
+    if not resolved_jsonl_path.exists():
+        raise FileNotFoundError(f"JSONL corpus not found: {resolved_jsonl_path}")
+
+    records = load_jsonl_records(resolved_jsonl_path)
+    documents = build_documents(records)
+
+    resolved_chunks_path.parent.mkdir(parents=True, exist_ok=True)
+
+    written = 0
+    with resolved_chunks_path.open("w", encoding="utf-8") as file:
+        for document_text, metadata in documents:
+            header, body = split_header_and_body(document_text)
+            units = split_into_structural_units(body)
+
+            packed_chunks = pack_units_into_chunks(
                 header=header,
                 units=units,
                 chunk_size=chunk_size,
                 chunk_overlap=chunk_overlap,
             )
 
-            # If unit splitting failed (e.g. empty body), fall back to plain splitting.
-            if not packed and body.strip():
-                splitter = RecursiveCharacterTextSplitter(
+            if not packed_chunks and body.strip():
+                fallback_splitter = build_fallback_splitter(
                     chunk_size=chunk_size,
                     chunk_overlap=chunk_overlap,
-                    separators=["\n\n", "\n", ". ", " ", ""],
                 )
-                for chunk_text in splitter.split_text(text):
-                    rec = {"text": chunk_text, "metadata": meta}
-                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                    count += 1
+                for chunk_text in fallback_splitter.split_text(document_text):
+                    write_chunk_record(file, chunk_text, metadata)
+                    written += 1
                 continue
 
-            for chunk_text, unit_start, unit_end in packed:
-                meta2 = dict(meta)
-                meta2["para_start"] = unit_start
-                meta2["para_end"] = unit_end
-                rec = {"text": chunk_text, "metadata": meta2}
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                count += 1
+            for chunk_text, unit_start, unit_end in packed_chunks:
+                chunk_metadata = dict(metadata)
+                chunk_metadata["para_start"] = unit_start
+                chunk_metadata["para_end"] = unit_end
 
-    print(f"Wrote {count} chunks to {chunks_path}")
+                write_chunk_record(file, chunk_text, chunk_metadata)
+                written += 1
+
+    print(f"Wrote {written} chunks to {resolved_chunks_path}")

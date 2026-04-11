@@ -1,101 +1,116 @@
 from __future__ import annotations
 
+import hashlib
+from pathlib import Path
 from typing import Any
 
 import chromadb
 
+from tek17.rag.config import HYBRID_CANDIDATE_MULTIPLIER
 from tek17.rag.retrieval.methods.dense import retrieve_dense
-from tek17.rag.retrieval.methods.sparse import retrieve_sparce
+from tek17.rag.retrieval.methods.sparse import retrieve_sparse
 
 
-def _chunk_key(doc: str, meta: dict[str, Any]) -> str:
-	section_id = str(meta.get("section_id", ""))
-	text_type = str(meta.get("text_type", ""))
-	para_start = str(meta.get("para_start", ""))
-	para_end = str(meta.get("para_end", ""))
-	title = str(meta.get("title", ""))
-	base = "|".join([section_id, title, text_type, para_start, para_end])
-	if base.strip("|"):
-		return base
-	# fallback
-	return str(hash(doc))
+def _chunk_key(doc: str, metadata: dict[str, Any]) -> str:
+    """Return a stable identifier for a retrieved chunk."""
+    section_id = str(metadata.get("section_id", ""))
+    text_type = str(metadata.get("text_type", ""))
+    para_start = str(metadata.get("para_start", ""))
+    para_end = str(metadata.get("para_end", ""))
+    title = str(metadata.get("title", ""))
+
+    base = "|".join([section_id, title, text_type, para_start, para_end])
+    if base.strip("|"):
+        return base
+
+    return hashlib.sha256(doc.encode("utf-8")).hexdigest()
 
 
 def retrieve_hybrid(
-	collection: chromadb.Collection,
-	query_text: str,
-	query_embedding: list[float],
-	top_k: int,
-	*,
-	alpha: float = 0.5,
-	dense_candidates: int | None = None,
-	sparce_candidates: int | None = None,
-	chunks_path=None,
+    collection: chromadb.Collection,
+    query_text: str,
+    query_embedding: list[float],
+    top_k: int,
+    *,
+    alpha: float = 0.5,
+    dense_candidates: int | None = None,
+    sparse_candidates: int | None = None,
+    chunks_path: Path | None = None,
 ) -> tuple[list[str], list[dict[str, Any]], list[float]]:
-	"""Hybrid retrieval = combine dense + sparse scores.
+    """Combine dense and sparse retrieval into one ranked result set.
 
-	alpha in [0,1] weights dense vs sparse.
-	Returns distances in [0,1] where lower is better.
-	"""
+    Alpha controls the dense-vs-sparse weighting:
+    - alpha = 1.0 -> dense only
+    - alpha = 0.0 -> sparse only
 
-	if chunks_path is None:
-		raise ValueError("chunks_path is required for hybrid retrieval")
+    Returns distances in [0, 1], where lower is better.
+    """
+    if chunks_path is None:
+        raise ValueError("chunks_path is required for hybrid retrieval")
 
-	cand_d = dense_candidates or max(top_k * 3, top_k)
-	cand_s = sparce_candidates or max(top_k * 3, top_k)
+    dense_k = dense_candidates or max(top_k * HYBRID_CANDIDATE_MULTIPLIER, top_k)
+    sparse_k = sparse_candidates or max(top_k * HYBRID_CANDIDATE_MULTIPLIER, top_k)
 
-	d_docs, d_metas, d_dists = retrieve_dense(collection, query_embedding, cand_d)
-	s_docs, s_metas, s_dists = retrieve_sparce(query_text, cand_s, chunks_path)
+    dense_docs, dense_metas, dense_dists = retrieve_dense(
+        collection,
+        query_embedding,
+        dense_k,
+    )
+    sparse_docs, sparse_metas, sparse_dists = retrieve_sparse(
+        query_text,
+        sparse_k,
+        chunks_path,
+    )
 
-	# Convert distances->scores (higher better)
-	dense_scores: dict[str, float] = {}
-	dense_payload: dict[str, tuple[str, dict[str, Any], float]] = {}
-	for doc, meta, dist in zip(d_docs, d_metas, d_dists):
-		key = _chunk_key(doc, meta)
-		score = 1.0 / (1.0 + float(dist))  # monotonic
-		if key not in dense_scores or score > dense_scores[key]:
-			dense_scores[key] = score
-			dense_payload[key] = (doc, meta, float(dist))
+    dense_scores: dict[str, float] = {}
+    dense_payload: dict[str, tuple[str, dict[str, Any], float]] = {}
 
-	sparse_scores: dict[str, float] = {}
-	sparse_payload: dict[str, tuple[str, dict[str, Any], float]] = {}
-	for doc, meta, dist in zip(s_docs, s_metas, s_dists):
-		key = _chunk_key(doc, meta)
-		score = 1.0 - float(dist)  # because dist in [0,1]
-		if key not in sparse_scores or score > sparse_scores[key]:
-			sparse_scores[key] = score
-			sparse_payload[key] = (doc, meta, float(dist))
+    for document, metadata, distance in zip(dense_docs, dense_metas, dense_dists):
+        key = _chunk_key(document, metadata)
+        score = 1.0 / (1.0 + float(distance))
+        if key not in dense_scores or score > dense_scores[key]:
+            dense_scores[key] = score
+            dense_payload[key] = (document, metadata, float(distance))
 
-	keys = set(dense_scores) | set(sparse_scores)
-	if not keys:
-		return [], [], []
+    sparse_scores: dict[str, float] = {}
+    sparse_payload: dict[str, tuple[str, dict[str, Any], float]] = {}
 
-	max_d = max(dense_scores.values(), default=0.0) or 1.0
-	max_s = max(sparse_scores.values(), default=0.0) or 1.0
+    for document, metadata, distance in zip(sparse_docs, sparse_metas, sparse_dists):
+        key = _chunk_key(document, metadata)
+        score = 1.0 - float(distance)
+        if key not in sparse_scores or score > sparse_scores[key]:
+            sparse_scores[key] = score
+            sparse_payload[key] = (document, metadata, float(distance))
 
-	combined: list[tuple[str, float]] = []
-	for k in keys:
-		d = dense_scores.get(k, 0.0) / max_d
-		s = sparse_scores.get(k, 0.0) / max_s
-		c = (alpha * d) + ((1.0 - alpha) * s)
-		combined.append((k, c))
+    keys = set(dense_scores) | set(sparse_scores)
+    if not keys:
+        return [], [], []
 
-	combined.sort(key=lambda x: x[1], reverse=True)
-	combined = combined[:top_k]
+    max_dense = max(dense_scores.values(), default=0.0) or 1.0
+    max_sparse = max(sparse_scores.values(), default=0.0) or 1.0
 
-	out_docs: list[str] = []
-	out_metas: list[dict[str, Any]] = []
-	out_dists: list[float] = []
+    combined_scores: list[tuple[str, float]] = []
+    for key in keys:
+        dense_score = dense_scores.get(key, 0.0) / max_dense
+        sparse_score = sparse_scores.get(key, 0.0) / max_sparse
+        combined_score = (alpha * dense_score) + ((1.0 - alpha) * sparse_score)
+        combined_scores.append((key, combined_score))
 
-	for k, c in combined:
-		# prefer dense metadata/doc if available, otherwise sparse
-		if k in dense_payload:
-			doc, meta, _ = dense_payload[k]
-		else:
-			doc, meta, _ = sparse_payload[k]
-		out_docs.append(doc)
-		out_metas.append(meta)
-		out_dists.append(1.0 - c)
+    combined_scores.sort(key=lambda item: item[1], reverse=True)
+    combined_scores = combined_scores[:top_k]
 
-	return out_docs, out_metas, out_dists
+    documents: list[str] = []
+    metadatas: list[dict[str, Any]] = []
+    distances: list[float] = []
 
+    for key, combined_score in combined_scores:
+        if key in dense_payload:
+            document, metadata, _ = dense_payload[key]
+        else:
+            document, metadata, _ = sparse_payload[key]
+
+        documents.append(document)
+        metadatas.append(metadata)
+        distances.append(1.0 - combined_score)
+
+    return documents, metadatas, distances

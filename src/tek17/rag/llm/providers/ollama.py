@@ -52,19 +52,3 @@ def ollama_chat_result(
         "finish_reason": finish_reason,
         "usage": usage,
     }
-
-
-def ollama_chat(
-    messages: list[dict[str, str]],
-    model: str,
-    base_url: str,
-    temperature: float,
-) -> str:
-    return str(
-        ollama_chat_result(
-            messages,
-            model=model,
-            base_url=base_url,
-            temperature=temperature,
-        )["content"]
-    )

@@ -13,39 +13,37 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from tek17.rag.embedding.client import embed_query
-from tek17.rag.llm.client import chat_result
-from tek17.rag.prompts import SYSTEM_PROMPT, SYSTEM_PROMPT_SHA256
-from tek17.rag.retrieval.client import get_collection, retrieve
 from tek17.rag.config import (
-    CHROMA_DIR,
     CHROMA_COLLECTION,
-    LOG_DIR,
-    QUERY_LOG_PATH,
+    CHROMA_DIR,
     CHUNKS_PATH,
-    OLLAMA_BASE_URL,
+    EMBED_BASE_URL,
     EMBED_MODEL,
     EMBED_PROVIDER,
+    HYBRID_ALPHA,
+    LLM_BASE_URL,
+    LLM_MAX_TOKENS,
     LLM_MODEL,
     LLM_PROVIDER,
-    LLM_MAX_TOKENS,
-    TOP_K,
-    RETRIEVAL_METHOD,
-    HYBRID_ALPHA,
+    LLM_TEMPERATURE,
+    LOG_DIR,
     PROMPT_VERSION,
+    QUERY_LOG_PATH,
+    RETRIEVAL_METHOD,
+    TOP_K,
 )
-from tek17.rag.retrieval.client import vectorstore_snapshot
+from tek17.rag.ingest import embed_query
+from tek17.rag.llm.dispatcher import chat_result
+from tek17.rag.prompts import get_system_prompt, get_system_prompt_sha256
+from tek17.rag.retrieval.client import get_collection, retrieve, vectorstore_snapshot
 
-# ---------------------------------------------------------------------------
-# FastAPI app
-# ---------------------------------------------------------------------------
+
 app = FastAPI(title="TEK17 RAG Server", version="0.1.0")
 
 app.add_middleware(
@@ -55,10 +53,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-# ---------------------------------------------------------------------------
-# Request / Response models
-# ---------------------------------------------------------------------------
 
 class QueryRequest(BaseModel):
     question: str = Field(..., min_length=1, description="User question about TEK17")
@@ -74,12 +68,16 @@ class QueryRequest(BaseModel):
         le=1.0,
         description="Hybrid weighting: alpha*dense + (1-alpha)*sparse",
     )
+    prompt_version: str = Field(
+        default=PROMPT_VERSION,
+        description="Prompt variant: baseline, relaxed, or strict",
+    )
     provider: Optional[str] = Field(
         default=None,
         description="LLM provider override: 'ollama' or 'openai' (defaults to TEK17_LLM_PROVIDER)",
     )
     model: str = Field(default=LLM_MODEL, description="LLM model name (Ollama or OpenAI)")
-    temperature: float = Field(default=0.3, ge=0.0, le=2.0)
+    temperature: float = Field(default=LLM_TEMPERATURE, ge=0.0, le=2.0)
     max_tokens: Optional[int] = Field(
         default=None,
         ge=1,
@@ -104,28 +102,15 @@ class QueryResponse(BaseModel):
     question: str
 
 
-# ---------------------------------------------------------------------------
-# Logging helpers
-# ---------------------------------------------------------------------------
-
 def _log_query_event(event: dict) -> None:
-    """Append a single query event as JSONL for offline analysis.
-
-    Logging failures should never break the API, so errors are swallowed.
-    """
-
+    """Append a single query event as JSONL for offline analysis."""
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
-        with QUERY_LOG_PATH.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+        with QUERY_LOG_PATH.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(event, ensure_ascii=False) + "\n")
     except Exception:
-        # Best-effort logging only
         return
 
-
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
 
 @app.get("/health")
 def health():
@@ -136,10 +121,9 @@ def health():
 def query(req: QueryRequest):
     try:
         collection = get_collection(CHROMA_DIR, CHROMA_COLLECTION)
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
 
-    # Vectorstore snapshot for reproducibility (cached)
     try:
         vs_snapshot = vectorstore_snapshot(CHROMA_DIR, CHROMA_COLLECTION)
     except Exception:
@@ -149,38 +133,42 @@ def query(req: QueryRequest):
     if retrieval_method == "sparce":
         retrieval_method = "sparse"
 
-    q_embedding: list[float] | None = None
+    prompt_version = (req.prompt_version or PROMPT_VERSION).strip().lower()
+    system_prompt = get_system_prompt(prompt_version)
+    system_prompt_sha256 = get_system_prompt_sha256(prompt_version)
+
+    query_embedding: list[float] | None = None
     if retrieval_method in {"dense", "hybrid"}:
-        q_embedding = embed_query(
+        query_embedding = embed_query(
             req.question,
             provider=EMBED_PROVIDER,
             model=EMBED_MODEL,
-            base_url=OLLAMA_BASE_URL,
+            base_url=EMBED_BASE_URL,
         )
 
     documents, metadatas, distances = retrieve(
         collection=collection,
         query_text=req.question,
-        query_embedding=q_embedding,
+        query_embedding=query_embedding,
         top_k=req.top_k,
         method=retrieval_method,
         chunks_path=CHUNKS_PATH,
         hybrid_alpha=req.hybrid_alpha,
     )
 
-    # Build context
     context_parts: list[str] = []
     sources: list[SourceChunk] = []
-    for doc, meta, dist in zip(documents, metadatas, distances):
-        context_parts.append(doc)
+
+    for document, metadata, distance in zip(documents, metadatas, distances):
+        context_parts.append(document)
         sources.append(
             SourceChunk(
-                section_id=meta.get("section_id", ""),
-                title=meta.get("title", ""),
-                chapter=meta.get("chapter", ""),
-                text_type=meta.get("text_type", ""),
-                text=doc,
-                distance=dist,
+                section_id=metadata.get("section_id", ""),
+                title=metadata.get("title", ""),
+                chapter=metadata.get("chapter", ""),
+                text_type=metadata.get("text_type", ""),
+                text=document,
+                distance=distance,
             )
         )
 
@@ -197,15 +185,14 @@ def query(req: QueryRequest):
 
     if not context_block.strip():
         answer = (
-            'KAN_IKKE_SVARE: Jeg har ikke nok informasjon i RAG-databasen/konteksten '
-            'til å gi et konkret svar på dette spørsmålet.'
+            "KAN_IKKE_SVARE: Jeg har ikke nok informasjon i RAG-databasen/konteksten "
+            "til å gi et konkret svar på dette spørsmålet."
         )
 
-        # Best-effort structured logging for refusal / retrieval analysis
         event = {
             "timestamp": datetime.utcnow().isoformat() + "Z",
-            "prompt_version": PROMPT_VERSION,
-            "system_prompt_sha256": SYSTEM_PROMPT_SHA256,
+            "prompt_version": prompt_version,
+            "system_prompt_sha256": system_prompt_sha256,
             "question": req.question,
             "top_k": req.top_k,
             "retrieval_method": retrieval_method,
@@ -219,13 +206,13 @@ def query(req: QueryRequest):
             "max_tokens": max_tokens,
             "retrieved": [
                 {
-                    "section_id": s.section_id,
-                    "title": s.title,
-                    "chapter": s.chapter,
-                    "text_type": s.text_type,
-                    "distance": s.distance,
+                    "section_id": source.section_id,
+                    "title": source.title,
+                    "chapter": source.chapter,
+                    "text_type": source.text_type,
+                    "distance": source.distance,
                 }
-                for s in sources
+                for source in sources
             ],
             "context": context_block,
             "answer": answer,
@@ -241,34 +228,33 @@ def query(req: QueryRequest):
             question=req.question,
         )
 
-    user_msg = (
+    user_message = (
         f"Kontekst fra TEK17:\n\n{context_block}\n\n"
         f"---\n\nSpørsmål: {req.question}"
     )
 
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_msg},
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_message},
     ]
 
     try:
         result = chat_result(
-            messages,
+            messages=messages,
             provider=provider,  # type: ignore[arg-type]
             model=req.model,
-            base_url=OLLAMA_BASE_URL,
+            base_url=LLM_BASE_URL,
             temperature=req.temperature,
             max_tokens=max_tokens,
         )
         answer = result.content
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"LLM provider error: {e}")
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"LLM provider error: {exc}")
 
-    # Best-effort structured logging for refusal / retrieval analysis
     event = {
         "timestamp": datetime.utcnow().isoformat() + "Z",
-        "prompt_version": PROMPT_VERSION,
-        "system_prompt_sha256": SYSTEM_PROMPT_SHA256,
+        "prompt_version": prompt_version,
+        "system_prompt_sha256": system_prompt_sha256,
         "question": req.question,
         "top_k": req.top_k,
         "retrieval_method": retrieval_method,
@@ -282,13 +268,13 @@ def query(req: QueryRequest):
         "max_tokens": max_tokens,
         "retrieved": [
             {
-                "section_id": s.section_id,
-                "title": s.title,
-                "chapter": s.chapter,
-                "text_type": s.text_type,
-                "distance": s.distance,
+                "section_id": source.section_id,
+                "title": source.title,
+                "chapter": source.chapter,
+                "text_type": source.text_type,
+                "distance": source.distance,
             }
-            for s in sources
+            for source in sources
         ],
         "context": context_block,
         "answer": answer,
@@ -308,27 +294,28 @@ def query(req: QueryRequest):
 @app.get("/models")
 def list_models():
     """Proxy to Ollama's model list so the Streamlit client can show available models."""
-    if (LLM_PROVIDER or "").strip().lower() != "ollama":
+    if LLM_PROVIDER != "ollama":
         return {
             "models": [],
             "note": "Model listing is only available for the Ollama provider.",
         }
+
     try:
         import requests
 
-        resp = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=10)
-        resp.raise_for_status()
-        models = resp.json().get("models", [])
-        return {"models": [m["name"] for m in models]}
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Cannot reach Ollama: {e}")
+        response = requests.get(f"{LLM_BASE_URL}/api/tags", timeout=10)
+        response.raise_for_status()
+        models = response.json().get("models", [])
+        return {"models": [model["name"] for model in models]}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Cannot reach Ollama: {exc}")
 
 
 @app.get("/collection/stats")
 def collection_stats():
     """Return basic stats about the vector store collection."""
     try:
-        col = get_collection(CHROMA_DIR, CHROMA_COLLECTION)
-        return {"collection": CHROMA_COLLECTION, "count": col.count()}
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        collection = get_collection(CHROMA_DIR, CHROMA_COLLECTION)
+        return {"collection": CHROMA_COLLECTION, "count": collection.count()}
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc))

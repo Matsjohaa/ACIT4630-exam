@@ -7,143 +7,161 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from tek17.rag.config import BM25_B, BM25_K1
 
 _TOKEN_RE = re.compile(r"[0-9A-Za-zÆØÅæøå]+", re.UNICODE)
 
 
 def _tokenize(text: str) -> list[str]:
-	return _TOKEN_RE.findall((text or "").lower())
+    return _TOKEN_RE.findall((text or "").lower())
 
 
 @dataclass(frozen=True)
 class _SparseIndex:
-	documents: list[str]
-	metadatas: list[dict[str, Any]]
-	doc_tokens: list[list[str]]
-	df: dict[str, int]
-	avgdl: float
+    documents: list[str]
+    metadatas: list[dict[str, Any]]
+    doc_tokens: list[list[str]]
+    df: dict[str, int]
+    avgdl: float
 
 
 _INDEX_CACHE: dict[Path, _SparseIndex] = {}
 
 
 def _load_chunks_jsonl(chunks_path: Path) -> tuple[list[str], list[dict[str, Any]]]:
-	documents: list[str] = []
-	metadatas: list[dict[str, Any]] = []
+    documents: list[str] = []
+    metadatas: list[dict[str, Any]] = []
 
-	with chunks_path.open("r", encoding="utf-8") as f:
-		for line in f:
-			line = line.strip()
-			if not line:
-				continue
-			row = json.loads(line)
-			documents.append(str(row.get("text", "")))
-			meta = row.get("metadata") or {}
-			metadatas.append(dict(meta))
+    with chunks_path.open("r", encoding="utf-8") as file:
+        for line in file:
+            line = line.strip()
+            if not line:
+                continue
 
-	return documents, metadatas
+            row = json.loads(line)
+            documents.append(str(row.get("text", "")))
+            metadata = row.get("metadata") or {}
+            metadatas.append(dict(metadata))
+
+    return documents, metadatas
 
 
 def _get_index(chunks_path: Path) -> _SparseIndex:
-	chunks_path = chunks_path.resolve()
-	if chunks_path in _INDEX_CACHE:
-		return _INDEX_CACHE[chunks_path]
+    resolved_chunks_path = chunks_path.resolve()
 
-	if not chunks_path.exists():
-		raise RuntimeError(
-			f"Chunks file not found at {chunks_path}. "
-			"Run `python -m tek17 ingest` (or chunk step) first."
-		)
+    if resolved_chunks_path in _INDEX_CACHE:
+        return _INDEX_CACHE[resolved_chunks_path]
 
-	documents, metadatas = _load_chunks_jsonl(chunks_path)
-	doc_tokens: list[list[str]] = []
-	df: dict[str, int] = {}
+    if not resolved_chunks_path.exists():
+        raise RuntimeError(
+            f"Chunks file not found at {resolved_chunks_path}. "
+            "Run `python -m tek17 chunk` (and ingest if needed) first."
+        )
 
-	total_len = 0
-	for doc in documents:
-		toks = _tokenize(doc)
-		doc_tokens.append(toks)
-		total_len += len(toks)
-		for t in set(toks):
-			df[t] = df.get(t, 0) + 1
+    documents, metadatas = _load_chunks_jsonl(resolved_chunks_path)
 
-	avgdl = (total_len / len(documents)) if documents else 0.0
+    doc_tokens: list[list[str]] = []
+    df: dict[str, int] = {}
+    total_length = 0
 
-	idx = _SparseIndex(
-		documents=documents,
-		metadatas=metadatas,
-		doc_tokens=doc_tokens,
-		df=df,
-		avgdl=avgdl,
-	)
-	_INDEX_CACHE[chunks_path] = idx
-	return idx
+    for document in documents:
+        tokens = _tokenize(document)
+        doc_tokens.append(tokens)
+        total_length += len(tokens)
+
+        for token in set(tokens):
+            df[token] = df.get(token, 0) + 1
+
+    avgdl = (total_length / len(documents)) if documents else 0.0
+
+    index = _SparseIndex(
+        documents=documents,
+        metadatas=metadatas,
+        doc_tokens=doc_tokens,
+        df=df,
+        avgdl=avgdl,
+    )
+    _INDEX_CACHE[resolved_chunks_path] = index
+
+    return index
 
 
 def _bm25_scores(
-	query_tokens: list[str],
-	idx: _SparseIndex,
-	k1: float = 1.5,
-	b: float = 0.75,
+    query_tokens: list[str],
+    index: _SparseIndex,
+    k1: float = BM25_K1,
+    b: float = BM25_B,
 ) -> list[float]:
-	# BM25 Okapi
-	N = len(idx.documents)
-	if N == 0:
-		return []
+    """Return BM25 scores for all indexed documents."""
+    document_count = len(index.documents)
+    if document_count == 0:
+        return []
 
-	scores = [0.0] * N
-	if not query_tokens:
-		return scores
+    scores = [0.0] * document_count
+    if not query_tokens:
+        return scores
 
-	q_terms = list(dict.fromkeys(query_tokens))
+    unique_query_terms = list(dict.fromkeys(query_tokens))
 
-	for term in q_terms:
-		df = idx.df.get(term, 0)
-		if df <= 0:
-			continue
-		idf = math.log((N - df + 0.5) / (df + 0.5) + 1.0)
-		for i, toks in enumerate(idx.doc_tokens):
-			if not toks:
-				continue
-			tf = toks.count(term)
-			if tf <= 0:
-				continue
-			dl = len(toks)
-			denom = tf + k1 * (1.0 - b + b * (dl / idx.avgdl if idx.avgdl else 0.0))
-			scores[i] += idf * (tf * (k1 + 1.0)) / (denom if denom else 1.0)
+    for term in unique_query_terms:
+        document_frequency = index.df.get(term, 0)
+        if document_frequency <= 0:
+            continue
 
-	return scores
+        idf = math.log(
+            (document_count - document_frequency + 0.5)
+            / (document_frequency + 0.5)
+            + 1.0
+        )
+
+        for i, tokens in enumerate(index.doc_tokens):
+            if not tokens:
+                continue
+
+            term_frequency = tokens.count(term)
+            if term_frequency <= 0:
+                continue
+
+            document_length = len(tokens)
+            denominator = term_frequency + k1 * (
+                1.0 - b + b * (document_length / index.avgdl if index.avgdl else 0.0)
+            )
+
+            scores[i] += idf * (term_frequency * (k1 + 1.0)) / (denominator or 1.0)
+
+    return scores
 
 
-def retrieve_sparce(
-	query_text: str,
-	top_k: int,
-	chunks_path: Path,
+def retrieve_sparse(
+    query_text: str,
+    top_k: int,
+    chunks_path: Path,
 ) -> tuple[list[str], list[dict[str, Any]], list[float]]:
-	"""Sparse retrieval over chunks via a lightweight BM25 implementation.
+    """Sparse retrieval over chunks using a lightweight BM25 implementation.
 
-	Returns distances in [0, 1] where lower is better (like Chroma distances).
-	"""
+    Returns distances in [0, 1], where lower is better.
+    """
+    index = _get_index(chunks_path)
+    query_tokens = _tokenize(query_text)
+    scores = _bm25_scores(query_tokens, index)
 
-	idx = _get_index(chunks_path)
-	q_toks = _tokenize(query_text)
-	scores = _bm25_scores(q_toks, idx)
+    if not scores:
+        return [], [], []
 
-	if not scores:
-		return [], [], []
+    ranked_indices = sorted(
+        range(len(scores)),
+        key=lambda i: scores[i],
+        reverse=True,
+    )
+    ranked_indices = [i for i in ranked_indices if scores[i] > 0.0][:top_k]
 
-	# Take top_k by score
-	ranked = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
-	ranked = [i for i in ranked if scores[i] > 0.0][:top_k]
+    if not ranked_indices:
+        return [], [], []
 
-	if not ranked:
-		return [], [], []
+    max_score = max(scores[i] for i in ranked_indices) or 1.0
 
-	max_score = max(scores[i] for i in ranked) or 1.0
-	documents = [idx.documents[i] for i in ranked]
-	metadatas = [idx.metadatas[i] for i in ranked]
-	# Convert to distance: higher score => smaller distance
-	distances = [1.0 - (scores[i] / max_score) for i in ranked]
+    documents = [index.documents[i] for i in ranked_indices]
+    metadatas = [index.metadatas[i] for i in ranked_indices]
+    distances = [1.0 - (scores[i] / max_score) for i in ranked_indices]
 
-	return documents, metadatas, distances
-
+    return documents, metadatas, distances

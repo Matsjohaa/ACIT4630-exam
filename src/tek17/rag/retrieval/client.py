@@ -4,46 +4,37 @@ import hashlib
 import logging
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
-from typing import Literal
+from typing import Any, Literal
 
 import chromadb
 from chromadb.config import Settings
 
-
-# Chroma's Posthog telemetry integration can be noisy if the installed
-# `posthog` package has an incompatible API. Telemetry is non-essential
-# for this project, so we silence the telemetry logger.
 logging.getLogger("chromadb.telemetry.product.posthog").disabled = True
 
+_COLLECTION_CACHE: dict[tuple[Path, str], chromadb.Collection] = {}
 
-_collection_cache: dict[tuple[Path, str], chromadb.Collection] = {}
-
-
-RetrievalMethod = Literal["dense", "hybrid", "sparse", "sparce"]
+RetrievalMethod = Literal["dense", "hybrid", "sparse"]
 
 
 def _sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
+    """Return the SHA256 checksum of a file."""
+    sha256 = hashlib.sha256()
+
+    with path.open("rb") as file:
         while True:
-            chunk = f.read(chunk_size)
+            chunk = file.read(chunk_size)
             if not chunk:
                 break
-            h.update(chunk)
-    return h.hexdigest()
+            sha256.update(chunk)
+
+    return sha256.hexdigest()
 
 
 @lru_cache(maxsize=16)
 def vectorstore_snapshot(chroma_dir: Path, collection_name: str) -> dict[str, Any]:
-    """Return a lightweight snapshot of the vector store for reproducibility.
-
-    Includes the collection count and a stable fingerprint of Chroma's
-    `chroma.sqlite3` file (when present).
-    """
-
-    col = get_collection(chroma_dir, collection_name)
-    count = col.count()
+    """Return a lightweight snapshot of the vector store for reproducibility."""
+    collection = get_collection(chroma_dir, collection_name)
+    count = collection.count()
 
     sqlite_path = chroma_dir / "chroma.sqlite3"
     sqlite_sha256: str | None = None
@@ -63,28 +54,26 @@ def vectorstore_snapshot(chroma_dir: Path, collection_name: str) -> dict[str, An
 
 
 def get_collection(chroma_dir: Path, collection_name: str) -> chromadb.Collection:
-    """Get (and cache) a ChromaDB collection for retrieval.
+    """Return a cached ChromaDB collection handle."""
+    resolved_chroma_dir = chroma_dir.resolve()
+    cache_key = (resolved_chroma_dir, collection_name)
 
-    This keeps the server code simple and centralises how we connect
-    to the persistent vector store.
-    """
+    if cache_key in _COLLECTION_CACHE:
+        return _COLLECTION_CACHE[cache_key]
 
-    key = (chroma_dir.resolve(), collection_name)
-    if key in _collection_cache:
-        return _collection_cache[key]
-
-    if not chroma_dir.exists():
+    if not resolved_chroma_dir.exists():
         raise RuntimeError(
-            f"ChromaDB vector store not found at {chroma_dir}. "
+            f"ChromaDB vector store not found at {resolved_chroma_dir}. "
             "Run `python -m tek17 ingest` first."
         )
 
     client = chromadb.PersistentClient(
-        path=str(chroma_dir),
+        path=str(resolved_chroma_dir),
         settings=Settings(anonymized_telemetry=False),
     )
     collection = client.get_collection(collection_name)
-    _collection_cache[key] = collection
+    _COLLECTION_CACHE[cache_key] = collection
+
     return collection
 
 
@@ -93,8 +82,7 @@ def query_collection(
     query_embedding: list[float],
     top_k: int,
 ) -> tuple[list[str], list[dict[str, Any]], list[float]]:
-    """Query a Chroma collection and return docs, metadatas, distances."""
-
+    """Query a Chroma collection and return documents, metadatas, and distances."""
     results = collection.query(
         query_embeddings=[query_embedding],
         n_results=top_k,
@@ -114,33 +102,36 @@ def retrieve(
     query_text: str,
     query_embedding: list[float] | None,
     top_k: int,
-    method: RetrievalMethod = "dense",
+    method: str = "dense",
     chunks_path: Path | None = None,
     hybrid_alpha: float = 0.5,
 ) -> tuple[list[str], list[dict[str, Any]], list[float]]:
-    """Retrieve documents using the selected retrieval method.
+    """Retrieve documents using the selected retrieval method."""
+    normalized_method = (method or "dense").strip().lower()
+    if normalized_method == "sparce":
+        normalized_method = "sparse"
 
-    Returns (documents, metadatas, distances) where lower distance is better.
-    """
-
-    m = (method or "dense").strip().lower()
-    # Backwards-compatible alias (older code used 'sparce')
-    if m == "sparce":
-        m = "sparse"
-
-    if m == "dense":
+    if normalized_method == "dense":
         if query_embedding is None:
             raise ValueError("query_embedding is required for dense retrieval")
-        return query_collection(collection=collection, query_embedding=query_embedding, top_k=top_k)
+        return query_collection(
+            collection=collection,
+            query_embedding=query_embedding,
+            top_k=top_k,
+        )
 
-    if m == "sparse":
+    if normalized_method == "sparse":
         if chunks_path is None:
             raise ValueError("chunks_path is required for sparse retrieval")
-        from tek17.rag.retrieval.methods.sparse import retrieve_sparce
+        from tek17.rag.retrieval.methods.sparse import retrieve_sparse
 
-        return retrieve_sparce(query_text=query_text, top_k=top_k, chunks_path=chunks_path)
+        return retrieve_sparse(
+            query_text=query_text,
+            top_k=top_k,
+            chunks_path=chunks_path,
+        )
 
-    if m == "hybrid":
+    if normalized_method == "hybrid":
         if query_embedding is None:
             raise ValueError("query_embedding is required for hybrid retrieval")
         if chunks_path is None:
@@ -156,4 +147,6 @@ def retrieve(
             chunks_path=chunks_path,
         )
 
-    raise ValueError(f"Unknown retrieval method: {method}")
+    raise ValueError(
+        f"Unknown retrieval method: {method}. Supported methods are 'dense', 'sparse', and 'hybrid'."
+    )

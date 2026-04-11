@@ -4,6 +4,12 @@ from pathlib import Path
 from tek17.rag.config import EMBED_MODEL as _CONFIG_EMBED_MODEL
 from tek17.rag.config import EMBED_PROVIDER as _CONFIG_EMBED_PROVIDER
 from tek17.rag.config import OLLAMA_BASE_URL as _CONFIG_OLLAMA_BASE_URL
+from tek17.rag.config import CHUNK_SIZE as _CONFIG_CHUNK_SIZE
+from tek17.rag.config import CHUNK_OVERLAP as _CONFIG_CHUNK_OVERLAP
+from tek17.rag.config import CHUNKS_PATH as _CONFIG_CHUNKS_PATH
+from tek17.rag.config import JSONL_PATH as _CONFIG_JSONL_PATH
+from tek17.rag.config import CHROMA_DIR as _CONFIG_CHROMA_DIR
+from tek17.rag.config import CHROMA_COLLECTION as _CONFIG_CHROMA_COLLECTION
 
 # ---------------------------------------------------------------------------
 # Lazy-import constants for CLI defaults.
@@ -14,14 +20,16 @@ _DEFAULT_ROOT_PRINT_URL = (
     "https://www.dibk.no/regelverk/byggteknisk-forskrift-tek17"
     "?subtype=root&print=true"
 )
-_DEFAULT_JSONL_PATH = Path("data/processed/tek17_dibk.jsonl")
-_DEFAULT_CHROMA_DIR = Path("data/vectorstore/chroma")
-_COLLECTION_NAME = "tek17"
+
+_DEFAULT_JSONL_PATH = _CONFIG_JSONL_PATH
+_DEFAULT_CHUNKS_PATH = _CONFIG_CHUNKS_PATH
+_DEFAULT_CHROMA_DIR = _CONFIG_CHROMA_DIR
+_COLLECTION_NAME = _CONFIG_CHROMA_COLLECTION
 _EMBED_MODEL = _CONFIG_EMBED_MODEL
 _EMBED_PROVIDER = _CONFIG_EMBED_PROVIDER
-_OLLAMA_BASE_URL = _CONFIG_OLLAMA_BASE_URL
-_CHUNK_SIZE = 800
-_CHUNK_OVERLAP = 200
+_BASE_URL = _CONFIG_OLLAMA_BASE_URL
+_CHUNK_SIZE = _CONFIG_CHUNK_SIZE
+_CHUNK_OVERLAP = _CONFIG_CHUNK_OVERLAP
 
 app = typer.Typer(
     help="TEK17 (DiBK) extraction, RAG and chat pipeline.",
@@ -83,7 +91,7 @@ def parse_dibk(
         help="Manifest JSONL produced by download-dibk.",
     ),
     out: Path = typer.Option(
-        Path("data/processed/tek17_dibk.jsonl"),
+        _DEFAULT_JSONL_PATH,
         "--out",
         help="Output JSONL: one record per provision (§ x-y).",
     ),
@@ -105,25 +113,17 @@ def parse_dibk(
     )
 
 
-# ── RAG commands ───────────────────────────────────────────────────────────
-
-
-@app.command("ingest")
-def ingest(
+@app.command("chunk")
+def chunk(
     jsonl: Path = typer.Option(
         _DEFAULT_JSONL_PATH,
         "--jsonl",
         help="Path to parsed TEK17 JSONL corpus.",
     ),
-    chroma_dir: Path = typer.Option(
-        _DEFAULT_CHROMA_DIR,
-        "--chroma-dir",
-        help="Directory for persistent ChromaDB vector store.",
-    ),
-    collection: str = typer.Option(
-        _COLLECTION_NAME,
-        "--collection",
-        help="ChromaDB collection name.",
+    out: Path = typer.Option(
+        _DEFAULT_CHUNKS_PATH,
+        "--out",
+        help="Output JSONL with chunked TEK17 records.",
     ),
     chunk_size: int = typer.Option(
         _CHUNK_SIZE,
@@ -135,6 +135,40 @@ def ingest(
         "--chunk-overlap",
         help="Overlap between chunks.",
     ),
+) -> None:
+    """
+    Build TEK17 chunks from the parsed JSONL corpus.
+    """
+    from .corpus.chunks import build_and_save_chunks
+
+    build_and_save_chunks(
+        jsonl_path=jsonl,
+        chunks_path=out,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+    )
+
+
+# ── RAG commands ───────────────────────────────────────────────────────────
+
+
+@app.command("ingest")
+def ingest(
+    chunks: Path = typer.Option(
+        _DEFAULT_CHUNKS_PATH,
+        "--chunks",
+        help="Path to chunked TEK17 JSONL corpus.",
+    ),
+    chroma_dir: Path = typer.Option(
+        _DEFAULT_CHROMA_DIR,
+        "--chroma-dir",
+        help="Directory for persistent ChromaDB vector store.",
+    ),
+    collection: str = typer.Option(
+        _COLLECTION_NAME,
+        "--collection",
+        help="ChromaDB collection name.",
+    ),
     embed_provider: str = typer.Option(
         _EMBED_PROVIDER,
         "--embed-provider",
@@ -145,33 +179,33 @@ def ingest(
         "--embed-model",
         help="Embedding model name (Ollama or OpenAI).",
     ),
-    ollama_url: str = typer.Option(
-        _OLLAMA_BASE_URL,
-        "--ollama-url",
-        help="Ollama server URL (used when --embed-provider=ollama).",
+    base_url: str = typer.Option(
+        _BASE_URL,
+        "--base-url",
+        help="Base URL for the embedding provider when applicable.",
     ),
 ) -> None:
     """
-    Ingest the parsed TEK17 JSONL into a ChromaDB vector store.
+    Embed TEK17 chunks and ingest them into ChromaDB.
 
-    Chunks the provisions, embeds them using Ollama, and stores
-    them in a persistent ChromaDB collection for RAG retrieval.
+    This command:
+    - reads precomputed chunks from JSONL
+    - generates embeddings
+    - stores them in a persistent ChromaDB collection
 
     Prerequisites:
-    - Ollama running with the embedding model pulled
-    - Parsed JSONL corpus (run download-dibk + parse-dibk first)
+    - Chunked corpus exists (run `tek17 chunk` first)
+    - Embedding backend available (Ollama running or OpenAI key set)
     """
     from .rag.ingest import run_ingest
 
     run_ingest(
-        jsonl_path=jsonl,
+        chunks_path=chunks,
         chroma_dir=chroma_dir,
         collection_name=collection,
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
         embed_provider=embed_provider,
         embed_model=embed_model,
-        ollama_url=ollama_url,
+        base_url=base_url,
     )
 
 
@@ -223,6 +257,13 @@ def ui(
 
     ui_path = files("tek17.app").joinpath("ui.py")
     subprocess.run(
-        [sys.executable, "-m", "streamlit", "run", str(ui_path),
-         "--server.port", str(port)],
+        [
+            sys.executable,
+            "-m",
+            "streamlit",
+            "run",
+            str(ui_path),
+            "--server.port",
+            str(port),
+        ],
     )

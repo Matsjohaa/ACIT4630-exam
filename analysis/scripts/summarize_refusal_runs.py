@@ -1,12 +1,4 @@
-"""Summarize one or more refusal-eval JSONL runs into CSV.
-
-Input files are the JSONL logs written by `analysis/scripts/test_refusal.py`.
-
-Example:
-  python analysis/scripts/summarize_refusal_runs.py \
-    --glob 'analysis/logging/refusal_openai_gpt-5.1_*.jsonl' \
-    --out-csv analysis/logging/refusal_summary.csv
-"""
+"""Summarize one or more refusal-eval JSONL runs into CSV."""
 
 from __future__ import annotations
 
@@ -14,79 +6,137 @@ import argparse
 import csv
 import json
 from pathlib import Path
+from typing import Any
+
+DEFAULT_REFUSAL_TYPES = [
+    "out_of_scope",
+    "in_domain_missing_context",
+    "(unspecified)",
+]
+
+DEFAULT_IN_SCOPE_SLICES = [
+    "in_scope_single",
+    "in_scope_multi",
+]
 
 
-def _infer_question_type(r: dict) -> str:
-    qt = r.get("question_type")
-    if isinstance(qt, str) and qt.strip():
-        return qt.strip()
+def _load_jsonl(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
 
-    # Fallback inference for older logs
-    if bool(r.get("should_refuse")):
-        return "refusal"
-
-    target_sections = r.get("target_sections") or []
-    if isinstance(target_sections, list) and len(target_sections) >= 2:
-        return "in_scope_multi"
-
-    rid = r.get("id")
-    if isinstance(rid, str) and "_multi_" in rid:
-        return "in_scope_multi"
-    return "in_scope_single"
-
-
-def _compute_metrics(tp: int, fp: int, tn: int, fn: int) -> dict[str, float]:
-    total = tp + fp + tn + fn
-    accuracy = (tp + tn) / total if total else 0.0
-    precision = tp / (tp + fp) if (tp + fp) else 0.0
-    recall = tp / (tp + fn) if (tp + fn) else 0.0
-    specificity = tn / (tn + fp) if (tn + fp) else 0.0
-    f1 = (2 * precision * recall) / (precision + recall) if (precision + recall) else 0.0
-
-    # Matthews correlation coefficient
-    denom = (tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)
-    mcc = ((tp * tn) - (fp * fn)) / (denom ** 0.5) if denom else 0.0
-
-    refusal_rate_pred = (tp + fp) / total if total else 0.0
-    refusal_rate_true = (tp + fn) / total if total else 0.0
-
-    bal_acc = (recall + specificity) / 2.0
-
-    return {
-        "accuracy": accuracy,
-        "precision": precision,
-        "recall": recall,
-        "specificity": specificity,
-        "f1": f1,
-        "balanced_accuracy": bal_acc,
-        "mcc": mcc,
-        "refusal_rate_pred": refusal_rate_pred,
-        "refusal_rate_true": refusal_rate_true,
-    }
-
-
-def _load_jsonl(path: Path) -> list[dict]:
-    rows: list[dict] = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
+    with path.open("r", encoding="utf-8") as file:
+        for line in file:
             line = line.strip()
             if not line:
                 continue
             rows.append(json.loads(line))
+
     return rows
+
+
+def _infer_question_type(row: dict[str, Any]) -> str:
+    question_type = row.get("question_type")
+    if isinstance(question_type, str) and question_type.strip():
+        return question_type.strip()
+
+    if bool(row.get("should_refuse")):
+        return "refusal"
+
+    target_sections = row.get("target_sections") or []
+    if isinstance(target_sections, list) and len(target_sections) >= 2:
+        return "in_scope_multi"
+
+    question_id = row.get("id")
+    if isinstance(question_id, str) and "_multi_" in question_id:
+        return "in_scope_multi"
+
+    return "in_scope_single"
+
+
+def _safe_div(num: float, den: float) -> float:
+    return num / den if den else 0.0
+
+
+def _compute_metrics(tp: int, fp: int, tn: int, fn: int) -> dict[str, float]:
+    total = tp + fp + tn + fn
+
+    precision = _safe_div(tp, tp + fp)
+    recall = _safe_div(tp, tp + fn)
+    specificity = _safe_div(tn, tn + fp)
+    f1 = _safe_div(2.0 * precision * recall, precision + recall)
+    balanced_accuracy = 0.5 * (recall + specificity)
+
+    denom = (tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)
+    mcc = ((tp * tn) - (fp * fn)) / (denom ** 0.5) if denom else 0.0
+
+    return {
+        "accuracy": _safe_div(tp + tn, total),
+        "precision": precision,
+        "recall": recall,
+        "specificity": specificity,
+        "f1": f1,
+        "balanced_accuracy": balanced_accuracy,
+        "mcc": mcc,
+        "refusal_rate_pred": _safe_div(tp + fp, total),
+        "refusal_rate_true": _safe_div(tp + fn, total),
+    }
+
+
+def _build_refusal_type_columns(
+    refusal_type_counts: dict[str, int],
+    refusal_type_refused: dict[str, int],
+) -> dict[str, object]:
+    columns: dict[str, object] = {}
+
+    for refusal_type in DEFAULT_REFUSAL_TYPES:
+        total = int(refusal_type_counts.get(refusal_type, 0))
+        refused = int(refusal_type_refused.get(refusal_type, 0))
+
+        columns[f"refuse_n__{refusal_type}"] = total
+        columns[f"refuse_refused__{refusal_type}"] = refused
+        columns[f"refuse_refused_rate__{refusal_type}"] = _safe_div(refused, total) if total else None
+
+    return columns
+
+
+def _build_slice_columns(
+    slice_counts: dict[str, int],
+    slice_over_refusal: dict[str, int],
+    slice_unsupported: dict[str, int],
+    slice_ungrounded: dict[str, int],
+    slice_strict_correct: dict[str, int],
+    slice_strict_den: dict[str, int],
+) -> dict[str, object]:
+    columns: dict[str, object] = {}
+
+    for slice_name in DEFAULT_IN_SCOPE_SLICES:
+        total = slice_counts.get(slice_name, 0)
+
+        columns[f"slice_n__{slice_name}"] = total
+        columns[f"slice_over_refusal_rate__{slice_name}"] = _safe_div(
+            slice_over_refusal[slice_name], total
+        ) if total else None
+        columns[f"slice_unsupported_rate__{slice_name}"] = _safe_div(
+            slice_unsupported[slice_name], total
+        ) if total else None
+        columns[f"slice_ungrounded_rate__{slice_name}"] = _safe_div(
+            slice_ungrounded[slice_name], total
+        ) if total else None
+        columns[f"slice_strict_correct_rate__{slice_name}"] = _safe_div(
+            slice_strict_correct[slice_name],
+            slice_strict_den[slice_name],
+        ) if slice_strict_den[slice_name] else None
+
+    return columns
 
 
 def _summarize_file(path: Path) -> dict[str, object]:
     rows = _load_jsonl(path)
     if not rows:
-        return {
-            "file": str(path),
-            "n": 0,
-        }
+        return {"file": str(path), "n": 0}
 
-    # Pull run-level fields from the first row (they should be constant per run)
     first = rows[0]
-    retrieval_method = str(first.get("retrieval_method", ""))
+
+    retrieval_method = str(first.get("retrieval_method", "")).strip().lower()
     if retrieval_method == "sparce":
         retrieval_method = "sparse"
 
@@ -102,7 +152,6 @@ def _summarize_file(path: Path) -> dict[str, object]:
     n_total = len(rows)
     n_errors = 0
 
-    # Lightweight correctness/support (optional)
     n_answer_correct = 0
     n_answer_correct_den = 0
     n_answer_correct_strict = 0
@@ -110,31 +159,26 @@ def _summarize_file(path: Path) -> dict[str, object]:
     n_unsupported_non_refusal = 0
     n_ungrounded_non_refusal = 0
 
-    # Slice: in-scope single vs multi
-    slice_counts: dict[str, int] = {"in_scope_single": 0, "in_scope_multi": 0}
-    slice_over_refusal: dict[str, int] = {"in_scope_single": 0, "in_scope_multi": 0}
-    slice_unsupported: dict[str, int] = {"in_scope_single": 0, "in_scope_multi": 0}
-    slice_ungrounded: dict[str, int] = {"in_scope_single": 0, "in_scope_multi": 0}
-    slice_strict_correct: dict[str, int] = {"in_scope_single": 0, "in_scope_multi": 0}
-    slice_strict_den: dict[str, int] = {"in_scope_single": 0, "in_scope_multi": 0}
+    slice_counts = {name: 0 for name in DEFAULT_IN_SCOPE_SLICES}
+    slice_over_refusal = {name: 0 for name in DEFAULT_IN_SCOPE_SLICES}
+    slice_unsupported = {name: 0 for name in DEFAULT_IN_SCOPE_SLICES}
+    slice_ungrounded = {name: 0 for name in DEFAULT_IN_SCOPE_SLICES}
+    slice_strict_correct = {name: 0 for name in DEFAULT_IN_SCOPE_SLICES}
+    slice_strict_den = {name: 0 for name in DEFAULT_IN_SCOPE_SLICES}
 
-    # Refusal type breakdown (optional)
-    refuse_type_counts: dict[str, int] = {}
-    refuse_type_refused: dict[str, int] = {}
+    refusal_type_counts: dict[str, int] = {}
+    refusal_type_refused: dict[str, int] = {}
 
-    for r in rows:
-        status = r.get("status")
-        if status == "query_failed":
+    for row in rows:
+        if row.get("status") == "query_failed":
             n_errors += 1
-            # Still count unsupported_non_refusal if present (should be False),
-            # but skip refusal confusion.
-            if r.get("unsupported_non_refusal"):
+            if row.get("unsupported_non_refusal"):
                 n_unsupported_non_refusal += 1
             continue
 
-        should_refuse = bool(r.get("should_refuse"))
-        model_refused = bool(r.get("model_refused"))
-        qtype = _infer_question_type(r)
+        should_refuse = bool(row.get("should_refuse"))
+        model_refused = bool(row.get("model_refused"))
+        question_type = _infer_question_type(row)
 
         if should_refuse and model_refused:
             tp += 1
@@ -145,74 +189,87 @@ def _summarize_file(path: Path) -> dict[str, object]:
         else:
             fn += 1
 
-        if r.get("retrieval_hit"):
+        if row.get("retrieval_hit"):
             retrieval_hits += 1
 
-        if r.get("unsupported_non_refusal"):
+        if row.get("unsupported_non_refusal"):
             n_unsupported_non_refusal += 1
 
-        if r.get("ungrounded_non_refusal"):
+        if row.get("ungrounded_non_refusal"):
             n_ungrounded_non_refusal += 1
 
-        if isinstance(r.get("answer_correct"), bool):
+        if isinstance(row.get("answer_correct"), bool):
             n_answer_correct_den += 1
-            if bool(r.get("answer_correct")):
+            if bool(row.get("answer_correct")):
                 n_answer_correct += 1
 
-        if isinstance(r.get("answer_correct_strict"), bool):
+        if isinstance(row.get("answer_correct_strict"), bool):
             n_answer_correct_strict_den += 1
-            if bool(r.get("answer_correct_strict")):
+            if bool(row.get("answer_correct_strict")):
                 n_answer_correct_strict += 1
 
-        # Slice stats (only meaningful for in-scope questions)
-        if not should_refuse and qtype in slice_counts:
-            slice_counts[qtype] += 1
+        if not should_refuse and question_type in slice_counts:
+            slice_counts[question_type] += 1
             if model_refused:
-                slice_over_refusal[qtype] += 1
-            if r.get("unsupported_non_refusal"):
-                slice_unsupported[qtype] += 1
-            if r.get("ungrounded_non_refusal"):
-                slice_ungrounded[qtype] += 1
-            if isinstance(r.get("answer_correct_strict"), bool):
-                slice_strict_den[qtype] += 1
-                if bool(r.get("answer_correct_strict")):
-                    slice_strict_correct[qtype] += 1
+                slice_over_refusal[question_type] += 1
+            if row.get("unsupported_non_refusal"):
+                slice_unsupported[question_type] += 1
+            if row.get("ungrounded_non_refusal"):
+                slice_ungrounded[question_type] += 1
+            if isinstance(row.get("answer_correct_strict"), bool):
+                slice_strict_den[question_type] += 1
+                if bool(row.get("answer_correct_strict")):
+                    slice_strict_correct[question_type] += 1
 
         if should_refuse:
-            refusal_type = r.get("refusal_type")
-            key = str(refusal_type).strip() if isinstance(refusal_type, str) and str(refusal_type).strip() else "(unspecified)"
-            refuse_type_counts[key] = refuse_type_counts.get(key, 0) + 1
+            refusal_type = row.get("refusal_type")
+            key = (
+                str(refusal_type).strip()
+                if isinstance(refusal_type, str) and str(refusal_type).strip()
+                else "(unspecified)"
+            )
+            refusal_type_counts[key] = refusal_type_counts.get(key, 0) + 1
             if model_refused:
-                refuse_type_refused[key] = refuse_type_refused.get(key, 0) + 1
+                refusal_type_refused[key] = refusal_type_refused.get(key, 0) + 1
 
     metrics = _compute_metrics(tp, fp, tn, fn)
 
     n_ok = n_total - n_errors
-    answer_correct_rate = (n_answer_correct / n_answer_correct_den) if n_answer_correct_den else None
+    answer_correct_rate = _safe_div(n_answer_correct, n_answer_correct_den) if n_answer_correct_den else None
     answer_correct_strict_rate = (
-        (n_answer_correct_strict / n_answer_correct_strict_den) if n_answer_correct_strict_den else None
+        _safe_div(n_answer_correct_strict, n_answer_correct_strict_den)
+        if n_answer_correct_strict_den
+        else None
     )
 
-    # Explicit refusal_type columns (commonly used types)
-    refuse_types = ["out_of_scope", "in_domain_missing_context", "(unspecified)"]
-    refuse_cols: dict[str, object] = {}
-    for t in refuse_types:
-        n_t = int(refuse_type_counts.get(t, 0))
-        refused_t = int(refuse_type_refused.get(t, 0))
-        refuse_cols[f"refuse_n__{t}"] = n_t
-        refuse_cols[f"refuse_refused__{t}"] = refused_t
-        refuse_cols[f"refuse_refused_rate__{t}"] = (refused_t / n_t) if n_t else None
+    refusal_type_columns = _build_refusal_type_columns(
+        refusal_type_counts,
+        refusal_type_refused,
+    )
+    slice_columns = _build_slice_columns(
+        slice_counts,
+        slice_over_refusal,
+        slice_unsupported,
+        slice_ungrounded,
+        slice_strict_correct,
+        slice_strict_den,
+    )
 
-    # Explicit single vs multi slice columns
-    slice_cols: dict[str, object] = {}
-    for s in ["in_scope_single", "in_scope_multi"]:
-        n_s = slice_counts.get(s, 0)
-        slice_cols[f"slice_n__{s}"] = n_s
-        slice_cols[f"slice_over_refusal_rate__{s}"] = (slice_over_refusal[s] / n_s) if n_s else None
-        slice_cols[f"slice_unsupported_rate__{s}"] = (slice_unsupported[s] / n_s) if n_s else None
-        slice_cols[f"slice_ungrounded_rate__{s}"] = (slice_ungrounded[s] / n_s) if n_s else None
-        slice_cols[f"slice_strict_correct_rate__{s}"] = (
-            (slice_strict_correct[s] / slice_strict_den[s]) if slice_strict_den[s] else None
+    refusal_type_breakdown = None
+    if refusal_type_counts:
+        refusal_type_breakdown = json.dumps(
+            {
+                key: {
+                    "n": refusal_type_counts.get(key, 0),
+                    "refused": refusal_type_refused.get(key, 0),
+                    "refused_rate": _safe_div(
+                        refusal_type_refused.get(key, 0),
+                        refusal_type_counts.get(key, 0),
+                    ) if refusal_type_counts.get(key) else 0.0,
+                }
+                for key in sorted(refusal_type_counts)
+            },
+            ensure_ascii=False,
         )
 
     return {
@@ -220,16 +277,16 @@ def _summarize_file(path: Path) -> dict[str, object]:
         "n": n_total,
         "n_ok": n_ok,
         "n_errors": n_errors,
-        "error_rate": (n_errors / n_total) if n_total else 0.0,
+        "error_rate": _safe_div(n_errors, n_total),
         "tp": tp,
         "fp": fp,
         "tn": tn,
         "fn": fn,
-        "retrieval_hit_rate": (retrieval_hits / n_ok) if n_ok else 0.0,
+        "retrieval_hit_rate": _safe_div(retrieval_hits, n_ok),
         "unsupported_non_refusal": n_unsupported_non_refusal,
-        "unsupported_non_refusal_rate": (n_unsupported_non_refusal / n_total) if n_total else 0.0,
+        "unsupported_non_refusal_rate": _safe_div(n_unsupported_non_refusal, n_total),
         "ungrounded_non_refusal": n_ungrounded_non_refusal,
-        "ungrounded_non_refusal_rate": (n_ungrounded_non_refusal / n_total) if n_total else 0.0,
+        "ungrounded_non_refusal_rate": _safe_div(n_ungrounded_non_refusal, n_total),
         "answer_correct_rate": answer_correct_rate,
         "answer_correct_strict_rate": answer_correct_strict_rate,
         "mode": mode,
@@ -239,71 +296,62 @@ def _summarize_file(path: Path) -> dict[str, object]:
         "retrieval_method": retrieval_method,
         "hybrid_alpha": hybrid_alpha,
         **metrics,
-        **refuse_cols,
-        **slice_cols,
-        "refusal_type_breakdown": json.dumps(
-            {
-                k: {
-                    "n": refuse_type_counts.get(k, 0),
-                    "refused": refuse_type_refused.get(k, 0),
-                    "refused_rate": (refuse_type_refused.get(k, 0) / refuse_type_counts[k]) if refuse_type_counts.get(k) else 0.0,
-                }
-                for k in sorted(refuse_type_counts.keys())
-            },
-            ensure_ascii=False,
-        )
-        if refuse_type_counts
-        else None,
+        **refusal_type_columns,
+        **slice_columns,
+        "refusal_type_breakdown": refusal_type_breakdown,
     }
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Summarize refusal run JSONL files.")
-    g = p.add_mutually_exclusive_group(required=True)
-    g.add_argument("--glob", type=str, help="Glob for JSONL files")
-    g.add_argument("--files", nargs="+", type=Path, help="Explicit JSONL files")
+    parser = argparse.ArgumentParser(description="Summarize refusal run JSONL files.")
+    group = parser.add_mutually_exclusive_group(required=True)
 
-    p.add_argument("--out-csv", type=Path, default=None)
-    return p
+    group.add_argument("--glob", type=str, help="Glob pattern for JSONL files")
+    group.add_argument("--files", nargs="+", type=Path, help="Explicit JSONL files")
+
+    parser.add_argument("--out-csv", type=Path, default=None)
+    return parser
+
+
+def _resolve_input_paths(glob_pattern: str | None, files: list[Path] | None) -> list[Path]:
+    if glob_pattern:
+        return sorted(Path().glob(glob_pattern))
+    return [Path(path) for path in (files or [])]
 
 
 def main() -> int:
     args = _build_parser().parse_args()
-
-    if args.glob:
-        paths = sorted(Path().glob(args.glob))
-    else:
-        paths = [Path(p) for p in args.files]
+    paths = _resolve_input_paths(args.glob, args.files)
 
     if not paths:
         print("No input files found.")
         return 2
 
-    summaries = [_summarize_file(p) for p in paths]
+    summaries = [_summarize_file(path) for path in paths]
 
     fieldnames: list[str] = []
-    for s in summaries:
-        for k in s.keys():
-            if k not in fieldnames:
-                fieldnames.append(k)
+    for summary in summaries:
+        for key in summary.keys():
+            if key not in fieldnames:
+                fieldnames.append(key)
 
     if args.out_csv is not None:
         args.out_csv.parent.mkdir(parents=True, exist_ok=True)
-        with args.out_csv.open("w", encoding="utf-8", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=fieldnames)
-            w.writeheader()
-            for row in summaries:
-                w.writerow(row)
+        with args.out_csv.open("w", encoding="utf-8", newline="") as file:
+            writer = csv.DictWriter(file, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(summaries)
         print(f"Wrote: {args.out_csv}")
-    else:
-        # Print a tiny table
-        for row in summaries:
-            print(
-                f"{row.get('file')}\t"
-                f"n={row.get('n')}\tacc={float(row.get('accuracy', 0.0)):.3f}\t"
-                f"f1={float(row.get('f1', 0.0)):.3f}\t"
-                f"mcc={float(row.get('mcc', 0.0)):.3f}"
-            )
+        return 0
+
+    for row in summaries:
+        print(
+            f"{row.get('file')}\t"
+            f"n={row.get('n')}\t"
+            f"acc={float(row.get('accuracy', 0.0)):.3f}\t"
+            f"f1={float(row.get('f1', 0.0)):.3f}\t"
+            f"mcc={float(row.get('mcc', 0.0)):.3f}"
+        )
 
     return 0
 

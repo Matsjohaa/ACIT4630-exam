@@ -2,30 +2,27 @@
 .venv/
 venv/
 
-# Data (raw + processed)
+# Data
 data/
 
-# Vector store (local DB)
-data/vectorstore/
-
-# Analysis
-# Keep analysis code + question sets in git. Ignore most generated logging artifacts
-# by default, but allow the refusal benchmark outputs to be committed.
-analysis/logging/*
+# Analysis logs
+analysis/logging/**
+!analysis/logging/
 !analysis/logging/refusal_*.jsonl
 !analysis/logging/refusal_*.csv
 
 # Environment variables
 .env
+.env.*
 
-# Python cache
+# Python
 __pycache__/
 *.py[cod]
 
 # Pytest
 .pytest_cache/
 
-# Build / packaging
+# Build
 dist/
 build/
 *.egg-info/
@@ -33,5 +30,22 @@ build/
 # Logs
 *.log
 
+# Temp / cache
+tmp/
+temp/
+*.tmp
+*.bak
+.cache/
+
 # OS / editor noise
 .DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/

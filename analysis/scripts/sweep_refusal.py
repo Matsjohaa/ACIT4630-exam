@@ -1,15 +1,4 @@
-"""Run a small parameter sweep for refusal evaluation.
-
-This is a thin orchestrator around `analysis/scripts/test_refusal.py` that:
-- runs a grid of (top_k, retrieval_method, hybrid_alpha, temperature)
-- writes one JSONL log file per run
-
-Example:
-  python analysis/scripts/sweep_refusal.py \
-    --eval-file analysis/questions/tek17_eval_questions.dibk_example.jsonl \
-    --llm-provider openai --llm-model gpt-5.1 --temperature 0 \
-    --top-k 10 --retrieval-method dense,sparse,hybrid --hybrid-alpha 0.5
-"""
+"""Run a small parameter sweep for refusal evaluation."""
 
 from __future__ import annotations
 
@@ -19,57 +8,92 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+from tek17.rag.config import (
+    BENCHMARK_OUT_DIR,
+    CHROMA_COLLECTION,
+    CHROMA_DIR,
+    EMBED_BASE_URL,
+    EMBED_MODEL,
+    EMBED_PROVIDER,
+    HYBRID_ALPHA,
+    LLM_MODEL,
+    LLM_PROVIDER,
+    LLM_TEMPERATURE,
+    PROMPT_VERSION,
+    RETRIEVAL_METHOD,
+    SERVER_URL,
+    SWEEP_REPEAT,
+    TEST_MODE,
+    TOP_K,
+)
+
 
 def _csv_list(value: str) -> list[str]:
-    parts = [p.strip() for p in value.split(",")]
-    return [p for p in parts if p]
+    parts = [part.strip() for part in (value or "").split(",")]
+    return [part for part in parts if part]
 
 
 def _csv_ints(value: str) -> list[int]:
-    out: list[int] = []
-    for p in _csv_list(value):
-        out.append(int(p))
-    return out
+    return [int(part) for part in _csv_list(value)]
 
 
 def _csv_floats(value: str) -> list[float]:
-    out: list[float] = []
-    for p in _csv_list(value):
-        out.append(float(p))
-    return out
+    return [float(part) for part in _csv_list(value)]
+
+
+def _normalize_retrieval_method(method: str) -> str:
+    normalized = (method or RETRIEVAL_METHOD).strip().lower()
+    if normalized == "sparce":
+        return "sparse"
+    return normalized
+
+
+def _sanitize_filename_part(value: str) -> str:
+    return (
+        str(value)
+        .strip()
+        .replace("/", "-")
+        .replace("\\", "-")
+        .replace(" ", "_")
+        .replace(":", "-")
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Sweep refusal evaluation runs.")
+    parser = argparse.ArgumentParser(description="Sweep refusal evaluation runs.")
 
-    p.add_argument("--eval-file", type=Path, required=True)
-    p.add_argument("--out-dir", type=Path, default=Path("analysis/logging"))
+    parser.add_argument("--eval-file", type=Path, required=True)
+    parser.add_argument("--out-dir", type=Path, default=BENCHMARK_OUT_DIR)
 
-    p.add_argument("--mode", choices=["local", "server"], default="local")
-    p.add_argument("--server-url", type=str, default="http://localhost:8000")
+    parser.add_argument("--mode", choices=["local", "server"], default=TEST_MODE)
+    parser.add_argument("--server-url", type=str, default=SERVER_URL)
 
-    p.add_argument("--top-k", type=str, default="6")
-    p.add_argument("--retrieval-method", type=str, default="dense")
-    p.add_argument("--hybrid-alpha", type=str, default="0.5")
-    p.add_argument("--temperature", type=str, default="0")
+    parser.add_argument("--top-k", type=str, default=str(TOP_K))
+    parser.add_argument("--retrieval-method", type=str, default=RETRIEVAL_METHOD)
+    parser.add_argument("--hybrid-alpha", type=str, default=str(HYBRID_ALPHA))
+    parser.add_argument("--temperature", type=str, default=str(LLM_TEMPERATURE))
+    parser.add_argument(
+        "--prompt-version",
+        type=str,
+        default=PROMPT_VERSION,
+        help="Comma-separated prompt variants to sweep, e.g. baseline,relaxed,strict",
+    )
 
-    # Local-mode knobs (passed through; harmless in server mode)
-    p.add_argument("--chroma-dir", type=Path, default=Path("data/vectorstore/chroma"))
-    p.add_argument("--collection", type=str, default="tek17")
+    parser.add_argument("--chroma-dir", type=Path, default=CHROMA_DIR)
+    parser.add_argument("--collection", type=str, default=CHROMA_COLLECTION)
 
-    p.add_argument("--ollama-url", type=str, default="http://localhost:11434")
+    parser.add_argument("--embed-base-url", type=str, default=EMBED_BASE_URL or "")
+    parser.add_argument("--llm-provider", choices=["ollama", "openai"], default=LLM_PROVIDER)
+    parser.add_argument("--embed-provider", choices=["ollama", "openai"], default=EMBED_PROVIDER)
 
-    p.add_argument("--llm-provider", choices=["ollama", "openai"], default="ollama")
-    p.add_argument("--embed-provider", choices=["ollama", "openai"], default="ollama")
+    parser.add_argument("--llm-model", type=str, default=LLM_MODEL)
+    parser.add_argument("--embed-model", type=str, default=EMBED_MODEL)
 
-    p.add_argument("--llm-model", type=str, default="llama3.2")
-    p.add_argument("--embed-model", type=str, default="nomic-embed-text")
+    parser.add_argument("--repeat", type=int, default=SWEEP_REPEAT)
+    parser.add_argument("--continue-on-error", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
 
-    p.add_argument("--repeat", type=int, default=1)
-    p.add_argument("--continue-on-error", action="store_true")
-    p.add_argument("--dry-run", action="store_true")
-
-    return p
+    return parser
 
 
 def main() -> int:
@@ -80,33 +104,44 @@ def main() -> int:
         raise SystemExit(f"Could not find test runner: {test_refusal}")
 
     top_ks = _csv_ints(args.top_k)
-    methods = [m.lower() for m in _csv_list(args.retrieval_method)]
+    methods = [_normalize_retrieval_method(method) for method in _csv_list(args.retrieval_method)]
     alphas = _csv_floats(args.hybrid_alpha)
-    temps = _csv_floats(args.temperature)
+    temperatures = _csv_floats(args.temperature)
+    prompt_versions = [version.strip().lower() for version in _csv_list(args.prompt_version)]
+
+    if not prompt_versions:
+        prompt_versions = [PROMPT_VERSION]
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    runs: list[tuple[int, str, float, float]] = []
+    runs: list[tuple[int, str, float, float, str]] = []
     for _ in range(int(args.repeat)):
-        for top_k in top_ks:
-            for method in methods:
-                if method == "sparce":
-                    method = "sparse"
-                if method == "hybrid":
-                    for alpha in alphas:
-                        for temp in temps:
-                            runs.append((top_k, method, float(alpha), float(temp)))
-                else:
-                    for temp in temps:
-                        runs.append((top_k, method, float(alphas[0] if alphas else 0.5), float(temp)))
+        for prompt_version in prompt_versions:
+            for top_k in top_ks:
+                for method in methods:
+                    if method == "hybrid":
+                        for alpha in alphas:
+                            for temperature in temperatures:
+                                runs.append(
+                                    (top_k, method, float(alpha), float(temperature), prompt_version)
+                                )
+                    else:
+                        fallback_alpha = float(alphas[0]) if alphas else HYBRID_ALPHA
+                        for temperature in temperatures:
+                            runs.append(
+                                (top_k, method, fallback_alpha, float(temperature), prompt_version)
+                            )
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    for idx, (top_k, method, alpha, temp) in enumerate(runs, start=1):
-        alpha_part = f"a{alpha:g}" if method == "hybrid" else ""
+    for index, (top_k, method, alpha, temperature, prompt_version) in enumerate(runs, start=1):
+        alpha_part = f"_a{alpha:g}" if method == "hybrid" else ""
         out_file = args.out_dir / (
-            f"refusal_{args.llm_provider}_{args.llm_model}_"
-            f"t{temp:g}_top{top_k}_{method}{('_' + alpha_part) if alpha_part else ''}_{timestamp}_{idx:03d}.jsonl"
+            f"refusal_{_sanitize_filename_part(args.llm_provider)}"
+            f"_{_sanitize_filename_part(args.llm_model)}"
+            f"_{_sanitize_filename_part(prompt_version)}"
+            f"_t{temperature:g}_top{top_k}_{method}"
+            f"{alpha_part}_{timestamp}_{index:03d}.jsonl"
         )
 
         cmd = [
@@ -123,15 +158,17 @@ def main() -> int:
             "--hybrid-alpha",
             str(alpha),
             "--temperature",
-            str(temp),
+            str(temperature),
+            "--prompt-version",
+            prompt_version,
             "--server-url",
             args.server_url,
             "--chroma-dir",
             str(args.chroma_dir),
             "--collection",
             args.collection,
-            "--ollama-url",
-            args.ollama_url,
+            "--embed-base-url",
+            args.embed_base_url,
             "--llm-provider",
             args.llm_provider,
             "--embed-provider",
@@ -144,18 +181,22 @@ def main() -> int:
             str(out_file),
         ]
 
-        print(f"[{idx}/{len(runs)}] top_k={top_k} method={method} alpha={alpha:g} temp={temp:g}")
-        print("  ->", out_file)
+        print(
+            f"[{index}/{len(runs)}] "
+            f"prompt={prompt_version} top_k={top_k} method={method} "
+            f"alpha={alpha:g} temp={temperature:g}"
+        )
+        print(f"  -> {out_file}")
 
         if args.dry_run:
             print("  (dry-run)")
             continue
 
-        proc = subprocess.run(cmd)
-        if proc.returncode != 0:
-            print(f"ERROR: run failed with exit code {proc.returncode}")
+        process = subprocess.run(cmd)
+        if process.returncode != 0:
+            print(f"ERROR: run failed with exit code {process.returncode}")
             if not args.continue_on_error:
-                return int(proc.returncode)
+                return int(process.returncode)
 
     return 0
 
