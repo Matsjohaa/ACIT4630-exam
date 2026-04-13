@@ -207,6 +207,8 @@ CONDITIONAL_REFUSAL_CATEGORY_NAMES = [
     "answer_without_evidence",
     "partial_support_answer",
     "correct_answer",
+    "correct_qualified_answer",
+    "missing_qualification_warning",
     "correct_refusal_with_partial_context",
     "correct_refusal_with_full_context",
     "under_refusal_with_partial_context",
@@ -214,3 +216,30 @@ CONDITIONAL_REFUSAL_CATEGORY_NAMES = [
     "unsafe_answer_no_evidence",
     "other",
 ]
+
+QUALIFICATION_PATTERNS = [
+    "trenger mer informasjon",
+    "trenger man mer informasjon",
+    "trenger jeg mer informasjon",
+    "trenger vi mer informasjon",
+    "uten mer informasjon",
+    "mangler informasjon",
+    "mangler opplysninger",
+    "krever tilleggskontekst",
+    "krever prosjektspesifikke opplysninger",
+    "krever mer informasjon",
+    "krever flere opplysninger",
+    "avhenger av",
+    "vil variere",
+    "kan variere",
+    "kan være tilpasset",
+    "må vurderes konkret",
+    "må vurderes ut fra",
+    "for en fullstendig vurdering",
+    "for en endelig vurdering",
+    "prosjektets spesifikke forhold",
+    "byggverkets spesifikke forhold",
+    "rom eller bygning",
+]
+
+QUALIFICATION_TOP_K = 10

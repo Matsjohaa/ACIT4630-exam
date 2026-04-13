@@ -66,12 +66,18 @@ def _any_target_hit(
 def _full_target_hit(
     retrieved_sections: Iterable[str],
     target_sections: Iterable[str],
+    requires_qualification: bool = False,
 ) -> bool:
     retrieved_set = _normalize_section_set(retrieved_sections)
     target_set = _normalize_section_set(target_sections)
 
     if not target_set:
         return False
+
+    any_hit = not retrieved_set.isdisjoint(target_set)
+
+    if requires_qualification:
+        return any_hit
 
     return target_set.issubset(retrieved_set)
 
@@ -114,12 +120,16 @@ def evaluate_retrieval(
     try:
         print(f"Using collection '{collection_name}' in {chroma_dir}")
         print(f"Top-k = {top_k}, eval items = {len(items)}")
-        print("id\twith_targets\tany_hit\tfull_hit\ttarget_sections\tretrieved_section_ids")
+        print(
+            "id\twith_targets\trequires_qualification\tany_hit\tfull_hit\t"
+            "target_sections\tretrieved_section_ids"
+        )
 
         for item in items:
             question_id = item.get("id", "")
             question = item.get("question", "")
             target_sections = item.get("target_sections") or []
+            requires_qualification = bool(item.get("requires_qualification", False))
 
             if not question:
                 continue
@@ -152,8 +162,21 @@ def evaluate_retrieval(
                 for metadata in metadatas
             ]
 
-            any_hit = _any_target_hit(retrieved_sections, target_sections) if has_targets else False
-            full_hit = _full_target_hit(retrieved_sections, target_sections) if has_targets else False
+            any_hit = (
+                _any_target_hit(retrieved_sections, target_sections)
+                if has_targets
+                else False
+            )
+
+            full_hit = (
+                _full_target_hit(
+                    retrieved_sections,
+                    target_sections,
+                    requires_qualification=requires_qualification,
+                )
+                if has_targets
+                else False
+            )
 
             if any_hit:
                 any_hits += 1
@@ -161,7 +184,8 @@ def evaluate_retrieval(
                 full_hits += 1
 
             print(
-                f"{question_id}\t{int(has_targets)}\t{int(any_hit)}\t{int(full_hit)}\t"
+                f"{question_id}\t{int(has_targets)}\t{int(requires_qualification)}\t"
+                f"{int(any_hit)}\t{int(full_hit)}\t"
                 f"{target_sections}\t{retrieved_sections}"
             )
 
@@ -172,6 +196,7 @@ def evaluate_retrieval(
                     "target_sections": target_sections,
                     "retrieved_sections": retrieved_sections,
                     "has_targets": has_targets,
+                    "requires_qualification": requires_qualification,
                     "any_hit": bool(any_hit),
                     "full_hit": bool(full_hit),
                     "top_k": top_k,
@@ -194,14 +219,13 @@ def evaluate_retrieval(
         print()
         print(f"Questions with target_sections: {total_with_targets}")
         print(f"Any hits (at least one target retrieved): {any_hits}")
-        print(f"Full hits (all target sections retrieved): {full_hits}")
+        print(f"Full hits (qualification-aware): {full_hits}")
         print(f"Any-hit Recall@{top_k}: {any_recall_at_k:.3f}")
         print(f"Full-hit Recall@{top_k}: {full_recall_at_k:.3f}")
 
     finally:
         if out_file is not None:
             out_file.close()
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate retrieval for TEK17 RAG.")

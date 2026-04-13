@@ -4,6 +4,20 @@ import hashlib
 import textwrap
 
 
+QUALIFICATION_APPENDIX = textwrap.dedent(
+    """\
+
+    Særregel for dette spørsmålet:
+    - Dette spørsmålet krever tilleggskontekst eller prosjektspesifikke opplysninger.
+    - Dersom konteksten inneholder noe relevant grunnlag, skal du ikke starte svaret med KAN_IKKE_SVARE.
+    - I slike tilfeller skal du gi et forsiktig, delvis og kvalifisert svar basert på det som faktisk finnes i konteksten.
+    - Du må eksplisitt si at mer informasjon trengs for en endelig vurdering.
+    - Du må eksplisitt si at svaret kan variere med prosjekt, situasjon eller kontekst.
+    - For denne typen spørsmål skal kvalifisert delvis svar foretrekkes fremfor avslag når noe relevant grunnlag finnes.
+    - Bare bruk KAN_IKKE_SVARE dersom konteksten ikke inneholder noe relevant grunnlag i det hele tatt.
+    """
+)
+
 SYSTEM_PROMPT_BASELINE = textwrap.dedent(
     """\
     Du er en ekspert på TEK17 (Byggteknisk forskrift) og tilhørende veiledning.
@@ -88,16 +102,22 @@ PROMPT_SHA256_BY_VERSION = {
 }
 
 
-def get_system_prompt(version: str) -> str:
+def get_system_prompt(
+    version: str,
+    requires_qualification: bool = False,
+) -> str:
     """Return the configured system prompt version, falling back to baseline."""
     normalized = (version or "").strip().lower()
-    return PROMPTS.get(normalized, SYSTEM_PROMPT_BASELINE)
+    base = PROMPTS.get(normalized, SYSTEM_PROMPT_BASELINE)
+
+    if requires_qualification:
+        return base + QUALIFICATION_APPENDIX
+    return base
 
 
-def get_system_prompt_sha256(version: str) -> str:
-    """Return the hash of the configured system prompt version."""
-    normalized = (version or "").strip().lower()
-    return PROMPT_SHA256_BY_VERSION.get(
-        normalized,
-        PROMPT_SHA256_BY_VERSION["baseline"],
-    )
+def get_system_prompt_sha256(
+    version: str,
+    requires_qualification: bool = False,
+) -> str:
+    prompt = get_system_prompt(version, requires_qualification=requires_qualification)
+    return hashlib.sha256(prompt.encode("utf-8")).hexdigest()

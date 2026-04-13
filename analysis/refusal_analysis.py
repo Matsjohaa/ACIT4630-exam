@@ -30,7 +30,15 @@ def classify_case(
     partial_hit: bool,
     should_refuse: bool,
     model_refused: bool,
+    requires_qualification: bool = False,
+    qualification_warning_present: bool = False,
 ) -> str:
+    if requires_qualification and (not should_refuse) and (not model_refused):
+        if not any_hit:
+            return "answer_without_evidence"
+        if not qualification_warning_present:
+            return "missing_qualification_warning"
+        return "correct_qualified_answer"
     if (not any_hit) and should_refuse and model_refused:
         return "retrieval_miss_correct_refusal"
     if partial_hit and (not should_refuse) and model_refused:

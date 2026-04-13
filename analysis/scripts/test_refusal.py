@@ -29,6 +29,7 @@ from tek17.rag.config import (
     LLM_TEMPERATURE,
     PROMPT_VERSION,
     PROMPT_VERSIONS,
+    QUALIFICATION_PATTERNS,
     REFUSAL_PATTERNS,
     REFUSAL_TAG,
     REQUEST_TIMEOUT_S,
@@ -37,6 +38,7 @@ from tek17.rag.config import (
     SOURCE_PREVIEW_LIMIT,
     TOP_K,
     WILSON_Z,
+    QUALIFICATION_TOP_K
 )
 from tek17.rag.ingest import embed_query
 from tek17.rag.llm.dispatcher import chat_result
@@ -77,6 +79,24 @@ class RetrievalCoverage:
     normalized_retrieved_sections: list[str]
     normalized_target_sections: list[str]
 
+def _section_chapter(section_id: str) -> str | None:
+    text = str(section_id or "").strip().replace("§", "").strip()
+    if "-" not in text:
+        return None
+    return text.split("-", 1)[0]
+
+
+def _target_chapters(target_sections: Iterable[str] | None) -> set[str]:
+    if not target_sections:
+        return set()
+
+    chapters: set[str] = set()
+    for section in target_sections:
+        chapter = _section_chapter(str(section))
+        if chapter is not None:
+            chapters.add(chapter)
+    return chapters
+
 
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
@@ -113,6 +133,12 @@ def _has_refusal_tag(answer: str) -> bool:
         return False
     return REFUSAL_TAG.lower() in text
 
+def _has_qualification_warning(answer: str) -> bool:
+    text = (answer or "").strip().lower()
+    if not text:
+        return False
+    return any(pattern in text for pattern in QUALIFICATION_PATTERNS)
+
 
 def _classify_refusal(answer: str) -> bool:
     text = (answer or "").strip().lower()
@@ -122,7 +148,16 @@ def _classify_refusal(answer: str) -> bool:
     if _has_refusal_tag(text):
         return True
 
-    return any(pattern in text for pattern in REFUSAL_PATTERNS)
+    refusal_prefixes = [
+        "kan_ikke_svare:",
+        "jeg kan ikke svare",
+        "jeg kan ikkje svare",
+        "jeg har ikke nok informasjon",
+        "jeg har ikkje nok informasjon",
+        "konteksten gir ikke grunnlag",
+        "konteksten gir ikkje grunnlag",
+    ]
+    return any(text.startswith(prefix) for prefix in refusal_prefixes)
 
 
 def _content_words(text: str) -> set[str]:
@@ -215,6 +250,7 @@ def _normalize_section_set(sections: Iterable[str]) -> set[str]:
 def _retrieval_coverage(
     sources: list[dict[str, Any]],
     target_sections: list[str],
+    requires_qualification: bool = False,
 ) -> RetrievalCoverage:
     retrieved_sections = [
         str((source or {}).get("section_id", "")).strip()
@@ -235,8 +271,13 @@ def _retrieval_coverage(
         )
 
     any_hit = not normalized_retrieved.isdisjoint(normalized_targets)
-    full_hit = normalized_targets.issubset(normalized_retrieved)
-    partial_hit = any_hit and not full_hit
+
+    if requires_qualification:
+        full_hit = any_hit
+        partial_hit = False
+    else:
+        full_hit = normalized_targets.issubset(normalized_retrieved)
+        partial_hit = any_hit and not full_hit
 
     return RetrievalCoverage(
         any_hit=any_hit,
@@ -248,7 +289,12 @@ def _retrieval_coverage(
     )
 
 
-def _query_server(question: str, cfg: RunConfig) -> dict[str, Any]:
+def _query_server(
+    question: str,
+    cfg: RunConfig,
+    requires_qualification: bool = False,
+    target_sections: list[str] | None = None,
+) -> dict[str, Any]:
     import requests
 
     payload: dict[str, Any] = {
@@ -257,6 +303,8 @@ def _query_server(question: str, cfg: RunConfig) -> dict[str, Any]:
         "retrieval_method": cfg.retrieval_method,
         "hybrid_alpha": cfg.hybrid_alpha,
         "prompt_version": cfg.prompt_version,
+        "requires_qualification": requires_qualification,
+        "target_sections": target_sections or [],
     }
     if cfg.model is not None:
         payload["model"] = cfg.model
@@ -272,8 +320,17 @@ def _query_server(question: str, cfg: RunConfig) -> dict[str, Any]:
     return response.json()
 
 
-def _query_local(question: str, cfg: RunConfig) -> dict[str, Any]:
+def _query_local(
+    question: str,
+    cfg: RunConfig,
+    requires_qualification: bool = False,
+    target_sections: list[str] | None = None,
+) -> dict[str, Any]:
     collection = get_collection(cfg.chroma_dir, cfg.collection)
+
+    effective_top_k = cfg.top_k
+    if requires_qualification:
+        effective_top_k = max(cfg.top_k, QUALIFICATION_TOP_K)
 
     query_embedding: list[float] | None = None
     if cfg.retrieval_method in {"dense", "hybrid"}:
@@ -288,11 +345,24 @@ def _query_local(question: str, cfg: RunConfig) -> dict[str, Any]:
         collection=collection,
         query_text=question,
         query_embedding=query_embedding,
-        top_k=cfg.top_k,
+        top_k=effective_top_k,
         method=cfg.retrieval_method,
         chunks_path=CHUNKS_PATH,
         hybrid_alpha=cfg.hybrid_alpha,
     )
+
+    if requires_qualification:
+        preferred_chapters = _target_chapters(target_sections)
+
+        if preferred_chapters:
+            filtered_rows = [
+                (document, metadata, distance)
+                for document, metadata, distance in zip(documents, metadatas, distances)
+                if _section_chapter((metadata or {}).get("section_id", "")) in preferred_chapters
+            ]
+
+            if filtered_rows:
+                documents, metadatas, distances = map(list, zip(*filtered_rows))
 
     sources: list[dict[str, Any]] = []
     context_parts: list[str] = []
@@ -311,11 +381,28 @@ def _query_local(question: str, cfg: RunConfig) -> dict[str, Any]:
         )
 
     context_block = "\n\n---\n\n".join(context_parts)
-    user_message = (
-        f"Kontekst fra TEK17:\n\n{context_block}\n\n"
-        f"---\n\nSpørsmål: {question}"
+
+    if requires_qualification:
+        user_message = (
+            "Kontekst fra TEK17:\n\n"
+            f"{context_block}\n\n"
+            "---\n\n"
+            "Dette spørsmålet krever prosjektspesifikke opplysninger eller mer kontekst. "
+            "Hvis konteksten inneholder noe relevant grunnlag, skal du ikke avslå. "
+            "Du skal i stedet gi et forsiktig og kvalifisert delvis svar basert på det som faktisk finnes i konteksten, "
+            "og eksplisitt si at mer informasjon trengs og at svaret kan variere med prosjekt/kontekst.\n\n"
+            f"Spørsmål: {question}"
+        )
+    else:
+        user_message = (
+            f"Kontekst fra TEK17:\n\n{context_block}\n\n"
+            f"---\n\nSpørsmål: {question}"
+        )
+
+    system_prompt = get_system_prompt(
+        cfg.prompt_version,
+        requires_qualification=requires_qualification,
     )
-    system_prompt = get_system_prompt(cfg.prompt_version)
 
     result = chat_result(
         messages=[
@@ -337,13 +424,29 @@ def _query_local(question: str, cfg: RunConfig) -> dict[str, Any]:
         "llm_finish_reason": result.finish_reason,
         "llm_usage": result.usage,
         "prompt_version": cfg.prompt_version,
+        "top_k_used": effective_top_k,
+        "requires_qualification": requires_qualification,
     }
 
-
-def _run_query(question: str, cfg: RunConfig) -> dict[str, Any]:
+def _run_query(
+    question: str,
+    cfg: RunConfig,
+    requires_qualification: bool = False,
+    target_sections: list[str] | None = None,
+) -> dict[str, Any]:
     if cfg.mode == "server":
-        return _query_server(question, cfg)
-    return _query_local(question, cfg)
+        return _query_server(
+            question,
+            cfg,
+            requires_qualification=requires_qualification,
+            target_sections=target_sections,
+        )
+    return _query_local(
+        question,
+        cfg,
+        requires_qualification=requires_qualification,
+        target_sections=target_sections,
+    )
 
 
 def _print_sources(
@@ -462,6 +565,14 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
         question = str(item.get("question", "")).strip()
         target_sections = item.get("target_sections") or []
         should_refuse = bool(item.get("should_refuse", False))
+        requires_qualification = bool(item.get("requires_qualification", False))
+
+        qualification_reason = item.get("qualification_reason")
+        qualification_reason = (
+            qualification_reason.strip()
+            if isinstance(qualification_reason, str) and qualification_reason.strip()
+            else None
+        )
 
         question_type = item.get("question_type")
         question_type = question_type.strip() if isinstance(question_type, str) and question_type.strip() else None
@@ -475,7 +586,12 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
         total += 1
 
         try:
-            data = _run_query(question, cfg)
+            data = _run_query(
+                question,
+                cfg,
+                requires_qualification=requires_qualification,
+                target_sections=list(target_sections) if isinstance(target_sections, list) else [],
+            )
         except Exception as exc:
             query_failed += 1
             print(f"{question_id}\t{should_refuse}\tERROR\t0\t0\t0\tquery_failed: {exc}")
@@ -523,6 +639,9 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
                         "embed_provider": cfg.embed_provider if cfg.mode == "local" else None,
                         "embed_model": cfg.embed_model if cfg.mode == "local" else None,
                         "vectorstore": vs_snapshot,
+                        "requires_qualification": requires_qualification,
+                        "qualification_reason": qualification_reason,
+                        "qualification_warning_present": qualification_warning_present if 'qualification_warning_present' in locals() else None,
                     }
                 )
             continue
@@ -533,6 +652,7 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
         coverage = _retrieval_coverage(
             sources,
             list(target_sections) if isinstance(target_sections, list) else [],
+            requires_qualification=requires_qualification,
         )
         any_hit = coverage.any_hit
         full_hit = coverage.full_hit
@@ -540,8 +660,13 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
         retrieval_hit = any_hit
 
         refused_tagged = _has_refusal_tag(answer)
+        qualification_warning_present = _has_qualification_warning(answer)
         refused_heuristic = _classify_refusal(answer)
-        model_refused = refused_tagged or refused_heuristic
+
+        if requires_qualification and any_hit and qualification_warning_present:
+            model_refused = False
+        else:
+            model_refused = refused_tagged or refused_heuristic
 
         groundedness = _groundedness_score(answer, sources)
         grounded = groundedness >= GROUNDEDNESS_THRESHOLD
@@ -557,11 +682,32 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
                 answer_correct_strict = False
             else:
                 answer_supported = bool(full_hit)
-                answer_correct = bool(full_hit)
-                answer_correct_strict = bool(full_hit) and bool(grounded)
+
+                if requires_qualification:
+                    answer_correct = bool(full_hit) and bool(qualification_warning_present)
+                    answer_correct_strict = (
+                            bool(full_hit)
+                            and bool(qualification_warning_present)
+                            and bool(grounded)
+                    )
+                else:
+                    answer_correct = bool(full_hit)
+                    answer_correct_strict = bool(full_hit) and bool(grounded)
 
         status = ""
-        if (not should_refuse) and (not model_refused) and (not any_hit):
+        if requires_qualification and (not should_refuse) and (not model_refused):
+            if not any_hit:
+                unsupported_non_refusal += 1
+                status = "unsupported_qualified_answer"
+            elif not qualification_warning_present:
+                status = "missing_qualification_warning"
+            elif full_hit and (not grounded):
+                ungrounded_non_refusal += 1
+                status = "ungrounded_qualified_answer"
+            else:
+                status = "correct_qualified_answer"
+
+        elif (not should_refuse) and (not model_refused) and (not any_hit):
             unsupported_non_refusal += 1
             status = "unsupported_answer"
         elif (not should_refuse) and (not model_refused) and partial_hit:
@@ -685,6 +831,9 @@ def run_eval(eval_file: Path, cfg: RunConfig, out: Path | None) -> int:
                     "embed_provider": cfg.embed_provider if cfg.mode == "local" else None,
                     "embed_model": cfg.embed_model if cfg.mode == "local" else None,
                     "vectorstore": vs_snapshot,
+                    "requires_qualification": requires_qualification,
+                    "qualification_reason": qualification_reason,
+                    "qualification_warning_present": qualification_warning_present if 'qualification_warning_present' in locals() else None,
                 }
             )
 

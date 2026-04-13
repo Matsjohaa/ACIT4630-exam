@@ -84,6 +84,10 @@ class QueryRequest(BaseModel):
         le=4096,
         description="Optional output token cap (defaults to TEK17_LLM_MAX_TOKENS if set)",
     )
+    requires_qualification: bool = Field(
+        default=False,
+        description="Whether the question requires explicit qualification due to missing project/context facts",
+    )
 
 
 class SourceChunk(BaseModel):
@@ -134,8 +138,14 @@ def query(req: QueryRequest):
         retrieval_method = "sparse"
 
     prompt_version = (req.prompt_version or PROMPT_VERSION).strip().lower()
-    system_prompt = get_system_prompt(prompt_version)
-    system_prompt_sha256 = get_system_prompt_sha256(prompt_version)
+    system_prompt = get_system_prompt(
+        prompt_version,
+        requires_qualification=req.requires_qualification,
+    )
+    system_prompt_sha256 = get_system_prompt_sha256(
+        prompt_version,
+        requires_qualification=req.requires_qualification,
+    )
 
     query_embedding: list[float] | None = None
     if retrieval_method in {"dense", "hybrid"}:
@@ -218,6 +228,7 @@ def query(req: QueryRequest):
             "answer": answer,
             "llm_finish_reason": None,
             "llm_usage": None,
+            "requires_qualification": req.requires_qualification,
         }
         _log_query_event(event)
 
@@ -280,6 +291,7 @@ def query(req: QueryRequest):
         "answer": answer,
         "llm_finish_reason": result.finish_reason,
         "llm_usage": result.usage,
+        "requires_qualification": req.requires_qualification,
     }
     _log_query_event(event)
 
