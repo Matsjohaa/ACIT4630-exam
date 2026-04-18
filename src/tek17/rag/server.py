@@ -250,11 +250,12 @@ def query(req: QueryRequest):
     ]
 
     try:
+        llm_base_url = LLM_BASE_URL if provider == "ollama" else None
         result = chat_result(
             messages=messages,
             provider=provider,  # type: ignore[arg-type]
             model=req.model,
-            base_url=LLM_BASE_URL,
+            base_url=llm_base_url,
             temperature=req.temperature,
             max_tokens=max_tokens,
         )

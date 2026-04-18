@@ -117,6 +117,8 @@ def summarize_run(path: Path) -> dict[str, Any] | None:
             any_hit = bool(any_hit)
             full_hit = bool(full_hit) if full_hit is not None else False
             partial_hit = bool(partial_hit) if partial_hit is not None else False
+            requires_qualification = _coalesce_bool(row, "requires_qualification") or False
+            qualification_warning_present = _coalesce_bool(row, "qualification_warning_present") or False
 
             n_rows += 1
 
@@ -145,6 +147,8 @@ def summarize_run(path: Path) -> dict[str, Any] | None:
                 partial_hit=partial_hit,
                 should_refuse=should_refuse,
                 model_refused=model_refused,
+                requires_qualification=requires_qualification,
+                qualification_warning_present=qualification_warning_present,
             )
             category_counts[category] += 1
 

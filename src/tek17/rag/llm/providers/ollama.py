@@ -4,6 +4,8 @@ from typing import Any
 
 import requests
 
+from tek17.rag.config import REQUEST_TIMEOUT_S
+
 
 def ollama_chat_result(
     messages: list[dict[str, str]],
@@ -27,7 +29,7 @@ def ollama_chat_result(
             "stream": False,
             "options": {"temperature": temperature},
         },
-        timeout=120,
+        timeout=REQUEST_TIMEOUT_S,
     )
     resp.raise_for_status()
     data = resp.json()

@@ -28,7 +28,7 @@ def chat(
     messages: list[dict[str, str]],
     provider: str = LLM_PROVIDER,
     model: str = LLM_MODEL,
-    base_url: str | None = LLM_BASE_URL,
+    base_url: str | None = None,
     temperature: float = LLM_TEMPERATURE,
     max_tokens: int | None = LLM_MAX_TOKENS,
 ) -> str:
@@ -47,7 +47,7 @@ def chat_result(
     messages: list[dict[str, str]],
     provider: str = LLM_PROVIDER,
     model: str = LLM_MODEL,
-    base_url: str | None = LLM_BASE_URL,
+    base_url: str | None = None,
     temperature: float = LLM_TEMPERATURE,
     max_tokens: int | None = LLM_MAX_TOKENS,
 ) -> ChatResult:
@@ -55,10 +55,11 @@ def chat_result(
     normalized_provider = (provider or "").strip().lower()
 
     if normalized_provider == "ollama":
+        resolved_base_url = (base_url or LLM_BASE_URL or "").strip()
         result = ollama_chat_result(
             messages=messages,
             model=model,
-            base_url=base_url or "",
+            base_url=resolved_base_url,
             temperature=temperature,
         )
         return ChatResult(

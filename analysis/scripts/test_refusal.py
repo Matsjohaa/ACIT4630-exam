@@ -411,7 +411,7 @@ def _query_local(
         ],
         provider=cfg.llm_provider,
         model=cfg.llm_model,
-        base_url=cfg.llm_base_url,
+        base_url=cfg.llm_base_url if cfg.llm_provider == "ollama" else None,
         temperature=cfg.temperature if cfg.temperature is not None else LLM_TEMPERATURE,
     )
 
