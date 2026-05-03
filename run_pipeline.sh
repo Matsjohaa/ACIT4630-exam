@@ -16,14 +16,14 @@ fi
 pip install -e "$SCRIPT_DIR" -q
 
 # Read config values for display and output naming
-LLM_PROVIDER=$(python -c "import configparser; c=configparser.ConfigParser(); c.read('tek17.conf'); print(c.get('llm','provider','ollama'))")
-LLM_MODEL=$(python -c "import configparser; c=configparser.ConfigParser(); c.read('tek17.conf'); print(c.get('llm','model','llama3.2'))")
-LLM_TEMP=$(python -c "import configparser; c=configparser.ConfigParser(); c.read('tek17.conf'); print(c.get('llm','temperature','0.0'))")
-RET_METHOD=$(python -c "import configparser; c=configparser.ConfigParser(); c.read('tek17.conf'); print(c.get('retrieval','method','dense'))")
-TOP_K=$(python -c "import configparser; c=configparser.ConfigParser(); c.read('tek17.conf'); print(c.get('retrieval','top_k','6'))")
-HYBRID_ALPHA=$(python -c "import configparser; c=configparser.ConfigParser(); c.read('tek17.conf'); print(c.get('retrieval','hybrid_alpha','0.5'))")
-CHUNK_SIZE=$(python -c "import configparser; c=configparser.ConfigParser(); c.read('tek17.conf'); print(c.get('chunking','chunk_size','800'))")
-PROMPT_VER=$(python -c "import configparser; c=configparser.ConfigParser(); c.read('tek17.conf'); print(c.get('prompt','version','baseline'))")
+LLM_PROVIDER=$(python -c "import configparser; c=configparser.ConfigParser(); c.read('tek17.conf'); print(c.get('llm','provider',fallback='ollama'))")
+LLM_MODEL=$(python -c "import configparser; c=configparser.ConfigParser(); c.read('tek17.conf'); print(c.get('llm','model',fallback='llama3.2'))")
+LLM_TEMP=$(python -c "import configparser; c=configparser.ConfigParser(); c.read('tek17.conf'); print(c.get('llm','temperature',fallback='0.0'))")
+RET_METHOD=$(python -c "import configparser; c=configparser.ConfigParser(); c.read('tek17.conf'); print(c.get('retrieval','method',fallback='dense'))")
+TOP_K=$(python -c "import configparser; c=configparser.ConfigParser(); c.read('tek17.conf'); print(c.get('retrieval','top_k',fallback='6'))")
+HYBRID_ALPHA=$(python -c "import configparser; c=configparser.ConfigParser(); c.read('tek17.conf'); print(c.get('retrieval','hybrid_alpha',fallback='0.5'))")
+CHUNK_SIZE=$(python -c "import configparser; c=configparser.ConfigParser(); c.read('tek17.conf'); print(c.get('chunking','chunk_size',fallback='800'))")
+PROMPT_VER=$(python -c "import configparser; c=configparser.ConfigParser(); c.read('tek17.conf'); print(c.get('prompt','version',fallback='baseline'))")
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 RUN_TAG="${LLM_PROVIDER}_${LLM_MODEL}_${PROMPT_VER}_t${LLM_TEMP}_top${TOP_K}_${RET_METHOD}"
