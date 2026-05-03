@@ -46,7 +46,7 @@ python -m tek17 chunk
 python -m tek17 ingest
 
 # Run evaluation (save results to logging)
-python analysis/scripts/test_refusal.py \
+PYTHONPATH="$SCRIPT_DIR/src:${PYTHONPATH:-}" python analysis/scripts/test_refusal.py \
   --eval-file analysis/questions/tek17_eval_questions.dibk_manual_v2_38.jsonl \
   --out "$OUT_FILE"
 
