@@ -31,8 +31,8 @@ The quickest way to build the corpus and run an evaluation:
 ./run_pipeline.sh
 ```
 
-This parses the TEK17 snapshot, chunks it, ingests into ChromaDB, and runs the
-38-question evaluation — all using settings from `tek17.conf`.
+This parses the TEK17 snapshot, chunks it, ingests into ChromaDB, and runs an
+evaluation on the manual question set.
 
 Or run each step individually:
 
