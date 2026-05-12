@@ -8,7 +8,7 @@ Includes evaluation scripts for retrieval quality and refusal behaviour.
 
 - Python ≥ 3.10
 - [Ollama](https://ollama.com) with `llama3.2` and `nomic-embed-text` pulled
-- (Optional) OpenAI API key in `.env` for GPT experiments
+- (Optional) OpenAI API key in `.env` for GPT experiments. Needed to run OpenAI
 
 ## Setup
 
@@ -23,7 +23,7 @@ All settings live in `tek17.conf` (INI format, project root).
 CLI flags override the config file (e.g. `python -m tek17 chunk --chunk-size 400`).  
 Secrets (API keys) go in `.env`.
 
-## Pipeline
+## Running pipeline
 
 The quickest way to build the corpus and run an evaluation:
 
@@ -32,7 +32,7 @@ The quickest way to build the corpus and run an evaluation:
 ```
 
 This parses the TEK17 snapshot, chunks it, ingests into ChromaDB, and runs an
-evaluation on the manual question set.
+evaluation on the manual question set, based on configutations in tek17.conf.
 
 Or run each step individually:
 
